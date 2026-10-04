@@ -1,0 +1,166 @@
+name: omnicloud-app
+
+# Fully local stack: Postgres, Redis and Weaviate run here; nothing depends on a hosted DB.
+# All persistent data lives in ${DATA_DIR:-./.data} (bind mounts), next to the project.
+#   make up  → http://localhost:${WEB_PORT:-8080}
+#
+#   web ─► api ─► postgres / redis
+#           │ BullMQ flows
+#           ▼
+#   worker × N  (upload │ embed │ ocr │ finalize)  ◄── autoscaler (queue depth → replicas)
+#           │
+#           ▼
+#   ml × M (SigLIP 2, faces, places, Gemini) ─► weaviate
+
+x-api-image: &api-image
+  build: { context: ./api, target: prod }
+  image: omnicloud-app/api:local
+  init: true
+  env_file: [{ path: .env, required: false }]
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://omni:${POSTGRES_PASSWORD:-omni}@postgres:5432/omni
+  REDIS_URL: redis://redis:6379
+  ML_URL: http://ml:8000
+  UPLOAD_DIR: /data/uploads
+
+services:
+  web:
+    build: { context: ./web, target: prod }
+    environment:
+      API_UPSTREAM: api:3000
+      MAX_BODY_SIZE: ${NGINX_MAX_BODY_SIZE:-512m}
+    ports: ["${WEB_PORT:-8080}:8080"]
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+  # One-shot: applies api/migrations/*.sql, then exits. Everything else waits for it.
+  migrate:
+    <<: *api-image
+    command: ["node", "src/db/migrate.js"]
+    environment: *app-env
+    healthcheck: { disable: true }
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    <<: *api-image
+    environment:
+      <<: *app-env
+      DB_POOL_MAX: 15
+    volumes: ["${DATA_DIR:-./.data}/uploads:/data/uploads", "${DATA_DIR:-./.data}/library:/data/library"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  # Baseline replica of the pipeline workers. The autoscaler clones it under load.
+  worker:
+    <<: *api-image
+    command: ["node", "src/worker.js"]
+    environment:
+      <<: *app-env
+      DB_POOL_MAX: 5
+    volumes: ["${DATA_DIR:-./.data}/uploads:/data/uploads", "${DATA_DIR:-./.data}/library:/data/library"]
+    healthcheck: { disable: true }
+    stop_grace_period: 2m # in-flight jobs finish before the container exits
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      ml: { condition: service_healthy }
+    restart: unless-stopped
+
+  autoscaler:
+    <<: *api-image
+    profiles: [autoscale]
+    command: ["node", "src/autoscaler.js"]
+    environment:
+      <<: *app-env
+      DOCKER_HOST: http://docker-proxy:2375
+      COMPOSE_PROJECT: omnicloud-app
+    healthcheck: { disable: true }
+    depends_on:
+      docker-proxy: { condition: service_started }
+      worker: { condition: service_started }
+    restart: unless-stopped
+
+  # Least-privilege gate in front of the Docker socket: only the /containers API is reachable,
+  # and only from the internal network (never published).
+  docker-proxy:
+    profiles: [autoscale]
+    image: tecnativa/docker-socket-proxy:latest
+    environment:
+      CONTAINERS: 1
+      POST: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      IMAGES: 0
+      NETWORKS: 0
+      VOLUMES: 0
+      EXEC: 0
+    volumes: ["${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro"]
+    restart: unless-stopped
+
+  ml:
+    build:
+      context: ./ml
+      target: prod
+      # The model is baked into the image; change it in .env, rebuild, then `make reindex`.
+      args:
+        EMBED_MODEL_NAME: ${EMBED_MODEL_NAME:-ViT-B-16-SigLIP2-256}
+        EMBED_MODEL_PRETRAIN: ${EMBED_MODEL_PRETRAIN:-webli}
+    image: omnicloud-app/ml:local
+    env_file: [{ path: .env, required: false }]
+    environment:
+      WEAVIATE_URL: http://weaviate:8080
+      TORCH_THREADS: ${TORCH_THREADS:-4}
+    stop_grace_period: 30s
+    depends_on:
+      weaviate: { condition: service_healthy }
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: omni
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-omni}
+      POSTGRES_DB: omni
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB"]
+    volumes: ["${DATA_DIR:-./.data}/postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omni -d omni"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:8 # Redis 8 ships the Bloom filter module built in
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes: ["${DATA_DIR:-./.data}/redis:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.39.5
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: none
+      ENABLE_MODULES: ""
+      CLUSTER_HOSTNAME: node1
+    volumes: ["${DATA_DIR:-./.data}/weaviate:/var/lib/weaviate"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/v1/.well-known/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+

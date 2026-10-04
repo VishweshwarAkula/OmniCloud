@@ -1,0 +1,59 @@
+# Dev overrides: hot reload, ports published for debugging (psql on 5432, redis on 6379).
+#   make dev → http://localhost:5173   (set PUBLIC_URL=http://localhost:5173 in .env)
+services:
+  web:
+    build: { context: ./web, target: dev }
+    environment:
+      VITE_API_PROXY: http://api:3000
+    ports: !override ["5173:5173"]
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+
+  migrate:
+    build: { context: ./api, target: dev }
+    image: omnicloud-app/api:dev
+    volumes: [./api/src:/app/src, ./api/migrations:/app/migrations]
+
+  api:
+    build: { context: ./api, target: dev }
+    image: omnicloud-app/api:dev
+    environment: { NODE_ENV: development }
+    ports: ["3000:3000"]
+    volumes: [./api/src:/app/src, ./api/migrations:/app/migrations]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      retries: 10
+
+  worker:
+    build: { context: ./api, target: dev }
+    image: omnicloud-app/api:dev
+    command: ["npm", "run", "dev:worker"]
+    environment: { NODE_ENV: development }
+    volumes: [./api/src:/app/src]
+
+  autoscaler:
+    build: { context: ./api, target: dev }
+    image: omnicloud-app/api:dev
+    environment: { NODE_ENV: development }
+    volumes: [./api/src:/app/src]
+
+  ml:
+    build: { context: ./ml, target: dev }
+    image: omnicloud-app/ml:dev
+    volumes: [./ml/app:/srv/app]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"]
+      interval: 15s
+      start_period: 90s
+      retries: 10
+
+  postgres:
+    ports: ["5432:5432"]
+
+  redis:
+    ports: ["6379:6379"]
+
+  weaviate:
+    ports: ["8081:8080"]
