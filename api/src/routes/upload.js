@@ -1,0 +1,129 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { Router } from "express";
+import multer from "multer";
+import rateLimit from "express-rate-limit";
+import { config } from "../config.js";
+import { asyncRoute, HttpError } from "../lib/errors.js";
+import { bloomMightContain } from "../lib/redis.js";
+import { PROVIDER_IDS } from "../db/index.js";
+import { requireAuth } from "../middleware/auth.js";
+import { connectedProviders, getProvider } from "../providers/index.js";
+import { findByHash, serializeFile } from "../services/files.js";
+import { enqueueIngest, flowId, jobStatus, queues, totalBacklog } from "../queues/index.js";
+
+fs.mkdirSync(config.UPLOAD_DIR, { recursive: true });
+
+const ACCEPTED = /^image\/(jpeg|png|gif|webp|bmp|heic|heif|avif|tiff)$/;
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: config.UPLOAD_DIR,
+    filename: (_req, _file, cb) => cb(null, crypto.randomUUID()),
+  }),
+  limits: { fileSize: config.MAX_UPLOAD_MB * 1024 * 1024, files: config.MAX_FILES_PER_UPLOAD },
+  fileFilter: (_req, file, cb) => cb(null, ACCEPTED.test(file.mimetype)),
+});
+
+const limiter = rateLimit({
+  windowMs: 60_000,
+  limit: config.UPLOAD_RATE_PER_MINUTE,
+  keyGenerator: (req) => req.user.id,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+});
+
+function sha256File(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    fs.createReadStream(filePath)
+      .on("data", (chunk) => hash.update(chunk))
+      .on("end", () => resolve(hash.digest("hex")))
+      .on("error", reject);
+  });
+}
+
+const router = Router();
+
+router.post(
+  "/upload",
+  requireAuth,
+  limiter,
+  upload.array("files"),
+  asyncRoute(async (req, res) => {
+    const files = req.files || [];
+    const cleanup = (f) => fs.promises.unlink(f.path).catch(() => {});
+    const provider = String(req.body.provider || "gdrive");
+    try {
+      const { label } = getProvider(provider);
+      if (!(await connectedProviders(req.user.id)).includes(provider)) {
+        throw new HttpError(409, `Connect ${label} before uploading.`, "provider_not_connected");
+      }
+      if (!files.length) throw new HttpError(400, "No supported images in the request.", "no_files");
+      // Backpressure: shed load before staging more files than the workers can drain.
+      if ((await totalBacklog()) > config.MAX_QUEUE_BACKLOG) {
+        res.set("Retry-After", "30");
+        throw new HttpError(503, "The pipeline is busy. Please retry in a moment.", "backpressure");
+      }
+    } catch (err) {
+      await Promise.all(files.map(cleanup));
+      throw err;
+    }
+
+    const results = await Promise.all(
+      files.map(async (file) => {
+        const fileHash = await sha256File(file.path);
+        const member = `${req.user.id}:${fileHash}`;
+
+        // Bloom says "definitely new" for most uploads, so the DB is only consulted on a maybe.
+        if (await bloomMightContain(member)) {
+          const existing = await findByHash(req.user.id, fileHash);
+          if (existing && existing.status !== "failed") {
+            await cleanup(file);
+            return { name: file.originalname, status: "duplicate", fileHash, file: serializeFile(existing) };
+          }
+        }
+
+        const jobId = flowId(req.user.id, fileHash);
+        const prior = await queues.finalize.getJob(jobId);
+        if (prior) {
+          const state = await prior.getState();
+          if (state === "completed" || state === "failed") await prior.remove({ removeChildren: true });
+          else {
+            await cleanup(file);
+            return { name: file.originalname, status: "queued", fileHash, jobId };
+          }
+        }
+
+        await enqueueIngest({
+            userId: req.user.id,
+            provider,
+            providerId: PROVIDER_IDS[provider],
+            tmpPath: file.path,
+            originalName: file.originalname,
+            ext: path.extname(file.originalname).toLowerCase().slice(0, 10),
+            mime: file.mimetype,
+            size: file.size,
+            fileHash,
+        });
+        return { name: file.originalname, status: "queued", fileHash, jobId };
+      })
+    );
+
+    res.status(202).json({ results });
+  })
+);
+
+router.get(
+  "/jobs/:id",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const status = await jobStatus(req.params.id);
+    if (!status || status.userId !== req.user.id) throw new HttpError(404, "Job not found.");
+    const { userId: _owner, ...publicStatus } = status;
+    res.json(publicStatus);
+  })
+);
+
+export default router;
