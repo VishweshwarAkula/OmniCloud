@@ -1,0 +1,11 @@
+.env
+.venv
+__pycache__
+*.pyc
+receipts
+ngrok
+app_legacy.py
+weaviate_init.py
+drop_recreate_collection.py
+.ruff_cache
+.pytest_cache
