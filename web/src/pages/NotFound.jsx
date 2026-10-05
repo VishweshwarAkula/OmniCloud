@@ -7,7 +7,7 @@ export default function NotFound() {
       <p className="font-mono text-sm text-mint">404</p>
       <h1 className="mt-4 text-4xl font-semibold tracking-tight sm:text-5xl">This page drifted off.</h1>
       <p className="mt-3 text-mist">The link may be old, or the page never existed.</p>
-      <Button to="/" variant="ghost" leading={ArrowLeft} className="mt-8">Home</Button>
+      <Button to="/app" variant="ghost" leading={ArrowLeft} className="mt-8">Back to library</Button>
     </section>
   );
 }

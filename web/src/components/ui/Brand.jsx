@@ -1,4 +1,4 @@
-import { DropboxLogo, GoogleDriveLogo, HardDrives } from "@phosphor-icons/react";
+import { Cloud, CloudArrowUp, DropboxLogo, GoogleDriveLogo } from "@phosphor-icons/react";
 import { useId } from "react";
 
 export function Logo({ className = "" }) {
@@ -30,7 +30,8 @@ export function Logo({ className = "" }) {
 export const providerMeta = {
   gdrive: { label: "Google Drive", Icon: GoogleDriveLogo, tint: "text-[#4f9cff]" },
   dropbox: { label: "Dropbox", Icon: DropboxLogo, tint: "text-[#3d8bff]" },
-  local: { label: "Local disk", Icon: HardDrives, tint: "text-mint" },
+  koofr: { label: "Koofr", Icon: Cloud, tint: "text-[#4ab3f4]" },
+  pcloud: { label: "pCloud", Icon: CloudArrowUp, tint: "text-[#17bed0]" },
 };
 
 export function ProviderBadge({ provider, className = "" }) {

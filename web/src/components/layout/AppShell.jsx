@@ -1,4 +1,4 @@
-import { CloudArrowUp, GearSix, ImagesSquare, MagnifyingGlass, Receipt, SignOut, UsersThree } from "@phosphor-icons/react";
+import { CloudArrowUp, GearSix, ImagesSquare, MagnifyingGlass, UsersThree } from "@phosphor-icons/react";
 import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router";
 import { useAuth } from "../../context/AuthContext";
@@ -8,6 +8,7 @@ import { formatBytes } from "../../lib/format";
 import { CommandPalette, useCommandPalette } from "../search/CommandPalette";
 import { Logo } from "../ui/Brand";
 import { Meter } from "../ui/Feedback";
+import { filesFromDrop } from "../../lib/folderFiles";
 import { DropOverlay, UploadPanel } from "../upload/UploadPanel";
 import { Backdrop } from "./Backdrop";
 
@@ -15,7 +16,6 @@ const nav = [
   { to: "/app", label: "Library", Icon: ImagesSquare, end: true },
   { to: "/app/search", label: "Search", Icon: MagnifyingGlass },
   { to: "/app/people", label: "People", Icon: UsersThree },
-  { to: "/app/bills", label: "Bills", Icon: Receipt },
   { to: "/app/settings", label: "Settings", Icon: GearSix },
 ];
 
@@ -29,7 +29,7 @@ function Avatar({ user, size = 32 }) {
   );
 }
 
-// Window-level drag & drop so images can be dropped anywhere in the app.
+// Window-level drag & drop so files and whole folders can be dropped anywhere in the app.
 function useWindowDrop(onFiles) {
   const [dragging, setDragging] = useState(false);
   const depth = useRef(0);
@@ -51,7 +51,7 @@ function useWindowDrop(onFiles) {
       e.preventDefault();
       depth.current = 0;
       setDragging(false);
-      onFiles(e.dataTransfer.files);
+      filesFromDrop(e.dataTransfer).then(onFiles);
     };
     window.addEventListener("dragenter", enter);
     window.addEventListener("dragover", over);
@@ -68,7 +68,7 @@ function useWindowDrop(onFiles) {
 }
 
 export function AppShell() {
-  const { user, signOut } = useAuth();
+  const { user } = useAuth();
   const { add, setPanelOpen, items, provider, setProvider } = useUploads();
   const { data: providers } = useProviders();
   const anyConnected = providers?.some((p) => p.connected);
@@ -153,9 +153,6 @@ export function AppShell() {
               <p className="truncate text-sm">{user?.name}</p>
               <p className="truncate text-[11px] text-haze">{user?.email}</p>
             </div>
-            <button onClick={signOut} className="rounded-full p-2 text-haze transition hover:bg-white/5 hover:text-fog" aria-label="Sign out">
-              <SignOut size={16} weight="light" />
-            </button>
           </div>
         </div>
       </aside>

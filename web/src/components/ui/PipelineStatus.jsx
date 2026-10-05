@@ -1,4 +1,4 @@
-import { CloudArrowUp, Cpu, Database, Receipt, UserFocus } from "@phosphor-icons/react";
+import { CloudArrowUp, Cpu, Database, UserFocus } from "@phosphor-icons/react";
 import { usePipeline } from "../../hooks/queries";
 import { Bezel } from "./Bezel";
 
@@ -6,7 +6,6 @@ const STAGES = [
   { key: "upload", label: "Upload", Icon: CloudArrowUp },
   { key: "embed", label: "Embed", Icon: Cpu },
   { key: "faces", label: "Faces", Icon: UserFocus },
-  { key: "ocr", label: "OCR", Icon: Receipt },
   { key: "finalize", label: "Finalize", Icon: Database },
 ];
 
@@ -43,7 +42,7 @@ export function PipelineStatus() {
           {isError ? "unavailable" : "live"}
         </span>
       </div>
-      <dl className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         {STAGES.map(({ key, label, Icon }) => (
           <div key={key} className="rounded-2xl bg-white/[0.03] p-4 ring-1 ring-white/[0.06]">
             <dt className="flex items-center gap-2 text-xs text-haze">

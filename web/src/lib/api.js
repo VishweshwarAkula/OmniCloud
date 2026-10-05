@@ -36,7 +36,7 @@ export async function api(path, { method = "GET", body, signal } = {}) {
 }
 
 // XHR because fetch still cannot report upload progress.
-export function uploadFile(file, { provider, onProgress, signal }) {
+export function uploadFile(file, { provider, folder, onProgress, signal }) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/upload");
@@ -64,6 +64,7 @@ export function uploadFile(file, { provider, onProgress, signal }) {
 
     const form = new FormData();
     form.append("provider", provider);
+    if (folder) form.append("folder", folder);
     form.append("files", file);
     xhr.send(form);
   });

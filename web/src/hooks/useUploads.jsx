@@ -1,11 +1,16 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { api, uploadFile } from "../lib/api";
+import { withFolder } from "../lib/folderFiles";
+import { CANCELLABLE, TRACKED } from "../lib/uploadStates";
 import { keys } from "./queries";
 
 const UploadContext = createContext(null);
 const ACCEPT = /^image\//;
+const DOCS = /\.(pdf|docx|txt|md)$/i;
 const MAX_PARALLEL = 3;
+const MAX_PREVIEWS = 40; // a 1,000-photo folder shouldn't decode 1,000 full-size previews
+const supported = (f) => !f.name.startsWith(".") && (ACCEPT.test(f.type) || /\.(heic|heif)$/i.test(f.name) || DOCS.test(f.name));
 let seq = 0;
 
 /*
@@ -22,28 +27,41 @@ export function UploadProvider({ children }) {
   const started = useRef(new Set()); // guards against double-starts (StrictMode re-runs effects)
 
   const patch = useCallback((id, p) => setItems((list) => list.map((it) => (it.id === id ? { ...it, ...p } : it))), []);
+  // Only applies while the item is still in one of `states` (a late poll or timer must not undo a cancel).
+  const patchIf = useCallback(
+    (id, states, p) => setItems((list) => list.map((it) => (it.id === id && states.includes(it.status) ? { ...it, ...p } : it))),
+    []
+  );
+  const itemsRef = useRef(items);
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
 
   const refreshData = useCallback(() => {
     qc.invalidateQueries({ queryKey: keys.files });
-    qc.invalidateQueries({ queryKey: keys.bills });
     qc.invalidateQueries({ queryKey: keys.storage });
   }, [qc]);
 
+  // Accepts Files (from a picker; folder pickers set webkitRelativePath) or {file, folder} from a drop.
+  // Returns how many were added; unsupported files (and hidden ones like .DS_Store) are skipped.
   const add = useCallback(
-    (fileList) => {
-      const files = Array.from(fileList || []);
-      const accepted = files.filter((f) => ACCEPT.test(f.type) || /\.(heic|heif)$/i.test(f.name));
+    (input) => {
+      const entries = Array.from(input || []).map((x) => (x instanceof File ? withFolder(x) : x));
+      const accepted = entries.filter((e) => supported(e.file));
       if (!accepted.length) return 0;
+      const withPreviews = accepted.length <= MAX_PREVIEWS;
       setItems((list) => {
-        const seen = new Set(list.filter((i) => i.status !== "error").map((i) => `${i.file.name}:${i.file.size}`));
+        const key = (e) => `${e.folder}/${e.file.name}:${e.file.size}`;
+        const seen = new Set(list.filter((i) => i.status !== "error").map(key));
         const fresh = accepted
-          .filter((f) => !seen.has(`${f.name}:${f.size}`))
-          .map((file) => {
+          .filter((e) => !seen.has(key(e)))
+          .map(({ file, folder }) => {
             const id = ++seq;
-            // HEIC can't be previewed in most browsers; the grid falls back to an icon.
-            const preview = /heic|heif/i.test(file.type || file.name) ? null : URL.createObjectURL(file);
+            // HEIC and documents can't be previewed as images; the panel shows an icon instead.
+            const previewable = withPreviews && !/heic|heif/i.test(file.type || file.name) && !DOCS.test(file.name);
+            const preview = previewable ? URL.createObjectURL(file) : null;
             if (preview) previews.current.set(id, preview);
-            return { id, file, preview, status: "pending", progress: 0, provider };
+            return { id, file, folder, preview, status: "pending", progress: 0, provider };
           });
         return [...list, ...fresh];
       });
@@ -66,6 +84,7 @@ export function UploadProvider({ children }) {
       patch(item.id, { status: "uploading" });
       uploadFile(item.file, {
         provider: item.provider,
+        folder: item.folder,
         signal: ctrl.signal,
         onProgress: (p) => patch(item.id, { progress: p }),
       })
@@ -80,7 +99,7 @@ export function UploadProvider({ children }) {
             patch(item.id, { status: "waiting", error: "Pipeline busy, retrying shortly" });
             setTimeout(() => {
               started.current.delete(item.id);
-              patch(item.id, { status: "pending", progress: 0, error: undefined });
+              patchIf(item.id, ["waiting"], { status: "pending", progress: 0, error: undefined });
             }, (err.retryAfter || 15) * 1000);
             return;
           }
@@ -88,7 +107,7 @@ export function UploadProvider({ children }) {
         })
         .finally(() => controllers.current.delete(item.id));
     });
-  }, [items, patch]);
+  }, [items, patch, patchIf]);
 
   // Poll server-side job state for anything in flight.
   const tracking = items.filter((i) => i.jobId && ["queued", "processing", "indexing"].includes(i.status));
@@ -104,13 +123,13 @@ export function UploadProvider({ children }) {
         const job = res.value;
         if (job.state === "completed") {
           finished = true;
-          patch(item.id, { status: "done", fileId: job.fileId });
+          patchIf(item.id, TRACKED, { status: "done", fileId: job.fileId });
         } else if (job.state === "failed") {
-          patch(item.id, { status: "error", error: job.error || "Processing failed" });
+          patchIf(item.id, TRACKED, { status: "error", error: job.error || "Processing failed" });
         } else {
           // Server stages: queued → uploading (to the cloud) → indexing → finalizing.
           const map = { queued: "queued", uploading: "processing", indexing: "indexing", finalizing: "indexing" };
-          patch(item.id, { status: map[job.stage] || "processing" });
+          patchIf(item.id, TRACKED, { status: map[job.stage] || "processing" });
         }
       });
       if (finished) refreshData();
@@ -119,7 +138,42 @@ export function UploadProvider({ children }) {
     // tracking is derived from items; trackingKey captures membership changes.
   }, [trackingKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const cancel = useCallback((id) => controllers.current.get(id)?.abort(), []);
+  /*
+    Cancel one upload or many (ids). Not yet sent: dropped here. Sending: the request is aborted.
+    Already on the server: its pipeline is stopped and anything it did is undone, including the
+    copy in the cloud. Uploads that finished meanwhile stay as they are.
+  */
+  const cancel = useCallback(
+    async (ids) => {
+      const wanted = new Set(Array.isArray(ids) ? ids : [ids]);
+      const targets = itemsRef.current.filter((i) => wanted.has(i.id) && CANCELLABLE.includes(i.status));
+      const onServer = [];
+      for (const item of targets) {
+        if (item.status === "uploading") controllers.current.get(item.id)?.abort();
+        else if (item.jobId && TRACKED.includes(item.status)) onServer.push(item);
+        else {
+          started.current.add(item.id); // never start it
+          patch(item.id, { status: "cancelled" });
+        }
+      }
+      if (!onServer.length) return;
+      onServer.forEach((i) => patch(i.id, { status: "cancelling" }));
+      const results = {};
+      try {
+        // Batches of 500 keep each request small.
+        for (let i = 0; i < onServer.length; i += 500) {
+          const ids = onServer.slice(i, i + 500).map((it) => it.jobId);
+          Object.assign(results, (await api("/jobs/cancel", { method: "POST", body: { ids } })).results);
+        }
+      } catch (err) {
+        onServer.forEach((i) => patchIf(i.id, ["cancelling"], { status: "error", error: `Couldn't cancel: ${err.message}` }));
+        return;
+      }
+      onServer.forEach((i) => patch(i.id, results[i.jobId] === "done" ? { status: "done" } : { status: "cancelled" }));
+      refreshData();
+    },
+    [patch, patchIf, refreshData]
+  );
 
   const retry = useCallback((id) => {
     started.current.delete(id);

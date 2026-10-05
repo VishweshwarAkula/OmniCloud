@@ -1,5 +1,6 @@
 import { CalendarBlank, Eye, MagicWand, MagnifyingGlass, MapPin, SmileyBlank, Tag, User } from "@phosphor-icons/react";
 import { formatDate } from "../../lib/format";
+import { DocumentCard } from "../../components/library/DocumentCard";
 import { useState } from "react";
 import { useSearchParams } from "react-router";
 import { GridSkeleton, ImageGrid } from "../../components/library/ImageGrid";
@@ -9,7 +10,7 @@ import { EmptyState, ErrorState } from "../../components/ui/Feedback";
 import { useSearch } from "../../hooks/queries";
 import { PageHeader } from "./PageHeader";
 
-const IDEAS = ["beach last summer", "screenshots from last week", "receipts", "sunset", "food in december", "people smiling"];
+const IDEAS = ["beach last summer", "screenshots from last week", "notes about databases", "sunset", "pdfs from this month", "people smiling"];
 
 function Understood({ u, reranked }) {
   if (!u) return null;
@@ -24,7 +25,7 @@ function Understood({ u, reranked }) {
   u.people?.forEach((p) => chips.push({ Icon: User, label: p }));
   u.kinds?.forEach((k) => chips.push({ Icon: Tag, label: k }));
   if (!chips.length) return null;
-  const via = { gemini: "Gemini", local: "on-device rules", none: "fallback" }[u.source] ?? u.source;
+  const via = { gemini: "Gemini", llm: "on-device LLM", local: "on-device rules", none: "fallback" }[u.source] ?? u.source;
   return (
     <div className="mb-6 flex flex-wrap items-center gap-2 text-sm" aria-label="How the search was understood">
       <span className="text-haze">Understood as</span>
@@ -67,11 +68,31 @@ export default function Search() {
   };
 
   const items = search.data?.items ?? [];
+  const documents = search.data?.documents ?? [];
+  // Show whichever kind of result matched better first.
+  const rank = { strong: 3, good: 2, possible: 1, keyword: 1, metadata: 1 };
+  const docsFirst = documents.length > 0 && (rank[documents[0]?.match] ?? 0) >= (rank[items[0]?.match] ?? 0);
+  const docSection = documents.length > 0 && (
+    <section aria-label="Documents" className="mb-10">
+      <h2 className="mb-4 text-sm uppercase tracking-[0.18em] text-haze">Documents · {documents.length}</h2>
+      <div className="grid gap-3 lg:grid-cols-2">
+        {documents.map((d) => (
+          <DocumentCard key={d.id} item={d} query={search.data?.understood?.visual || q} onOpen={setOpen} />
+        ))}
+      </div>
+    </section>
+  );
+  const photoSection = items.length > 0 && (
+    <section aria-label="Photos" className="mb-10">
+      <h2 className="mb-4 text-sm uppercase tracking-[0.18em] text-haze">Photos · {items.length}</h2>
+      <ImageGrid items={items} onOpen={setOpen} />
+    </section>
+  );
 
   return (
     <>
       <PageHeader eyebrow="Semantic search" title="Describe it. We'll find it.">
-        Ask like you would a friend: “Priya at the beach in Goa last summer”. Dates, places and people become filters, SigLIP 2 finds what&apos;s in the picture, and the best results get a second look.
+        Ask like you would a friend: “Priya at the beach last summer” or “notes about database normalization”. Photos are matched by what&apos;s in them, documents by what they say, and dates, places and people become filters.
       </PageHeader>
 
       <form
@@ -108,24 +129,32 @@ export default function Search() {
         <GridSkeleton count={8} />
       ) : search.isError ? (
         <ErrorState error={search.error} onRetry={() => search.refetch()} />
-      ) : !items.length ? (
+      ) : !items.length && !documents.length ? (
         <>
         <Understood u={search.data?.understood} reranked={search.data?.reranked} />
         <EmptyState icon={SmileyBlank} title={`Nothing like “${q}” yet`}>
-          Try a broader description. Newly uploaded images become searchable a few seconds after indexing.
+          Try a broader description. New uploads become searchable a few seconds after indexing.
         </EmptyState>
         </>
       ) : (
         <>
           <Understood u={search.data?.understood} reranked={search.data?.reranked} />
-          <p className="mb-5 text-sm text-mist">
-            {items.length} best {items.length === 1 ? "match" : "matches"} for <span className="text-fog">“{q}”</span>
-          </p>
-          <ImageGrid items={items} onOpen={setOpen} />
+          {search.reranking && <p className="mb-3 animate-pulse text-xs text-haze">Refining the order…</p>}
+          {docsFirst ? (
+            <>
+              {docSection}
+              {photoSection}
+            </>
+          ) : (
+            <>
+              {photoSection}
+              {docSection}
+            </>
+          )}
         </>
       )}
 
-      <Lightbox item={open} onClose={() => setOpen(null)} />
+      <Lightbox item={open} onClose={() => setOpen(null)} query={search.data?.understood?.visual || q} />
     </>
   );
 }

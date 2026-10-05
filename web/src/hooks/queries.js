@@ -6,7 +6,6 @@ export const keys = {
   storage: ["providers", "storage"],
   files: ["files"],
   search: (q) => ["search", q],
-  bills: ["bills"],
 };
 
 export function useProviders() {
@@ -24,6 +23,18 @@ export function useConnectProvider() {
   });
 }
 
+// Credential-based providers (Koofr: email + app password).
+export function useConnectWithCredentials() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ provider, email, password }) => api(`/providers/${provider}/credentials`, { method: "POST", body: { email, password } }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: keys.providers });
+      qc.invalidateQueries({ queryKey: keys.storage });
+    },
+  });
+}
+
 export function useDisconnectProvider() {
   const qc = useQueryClient();
   return useMutation({
@@ -32,15 +43,16 @@ export function useDisconnectProvider() {
   });
 }
 
-export function useFiles(tag, person) {
+export function useFiles(tag, person, folder) {
   return useInfiniteQuery({
-    queryKey: [...keys.files, tag ?? null, person ?? null],
+    queryKey: [...keys.files, tag ?? null, person ?? null, folder ?? null],
     initialPageParam: null,
     queryFn: ({ pageParam, signal }) => {
       const qs = new URLSearchParams({ limit: "30" });
       if (pageParam) qs.set("cursor", pageParam);
       if (tag) qs.set("tag", tag);
       if (person) qs.set("person", person);
+      if (folder) qs.set("folder", folder);
       return api(`/files?${qs}`, { signal });
     },
     getNextPageParam: (last) => last.nextCursor,
@@ -50,11 +62,11 @@ export function useFiles(tag, person) {
 export function useDeleteFile() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id) => api(`/files/${id}`, { method: "DELETE" }),
+    // fromCloud=false only forgets the file in OmniCloud; the copy in the cloud stays.
+    mutationFn: ({ id, fromCloud }) => api(`/files/${id}${fromCloud ? "?cloud=1" : ""}`, { method: "DELETE" }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: keys.files });
       qc.invalidateQueries({ queryKey: ["search"] });
-      qc.invalidateQueries({ queryKey: keys.bills });
       qc.invalidateQueries({ queryKey: keys.storage });
     },
   });
@@ -62,18 +74,25 @@ export function useDeleteFile() {
 
 // Submit-driven: the query string in the URL is the single source of truth, and
 // TanStack Query aborts superseded requests, so stale results can't overwrite fresh ones.
+// Two phases: fast results immediately, then the same search with the (slower, possibly
+// API-backed) re-ranking pass. The UI shows the fast results until the re-ranked ones land.
 export function useSearch(q) {
-  return useQuery({
-    queryKey: keys.search(q),
-    queryFn: ({ signal }) => api("/search", { method: "POST", body: { query: q, k: 30 }, signal }),
+  const fast = useQuery({
+    queryKey: [...keys.search(q), "fast"],
+    queryFn: ({ signal }) => api("/search", { method: "POST", body: { query: q, k: 30, rerank: false }, signal }),
     enabled: Boolean(q),
     staleTime: 60_000,
   });
+  const reranked = useQuery({
+    queryKey: [...keys.search(q), "reranked"],
+    queryFn: ({ signal }) => api("/search", { method: "POST", body: { query: q, k: 30 }, signal }),
+    enabled: Boolean(q) && fast.isSuccess && (fast.data?.items?.length ?? 0) > 2,
+    staleTime: 60_000,
+  });
+  const best = reranked.data ?? fast.data;
+  return { ...fast, data: best, reranking: reranked.isFetching };
 }
 
-export function useBills() {
-  return useQuery({ queryKey: keys.bills, queryFn: ({ signal }) => api("/bills/summary", { signal }) });
-}
 
 export function usePipeline() {
   return useQuery({
@@ -86,6 +105,24 @@ export function usePipeline() {
 
 export function useTags() {
   return useQuery({ queryKey: [...keys.files, "tags"], queryFn: ({ signal }) => api("/files/tags", { signal }), select: (d) => d.tags, staleTime: 60_000 });
+}
+
+// fromCloud=false only forgets the folder's files in OmniCloud; the cloud copies stay.
+export function useDeleteFolder() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ path, fromCloud }) =>
+      api(`/folders?${new URLSearchParams({ path, ...(fromCloud && { cloud: "1" }) })}`, { method: "DELETE" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: keys.files });
+      qc.invalidateQueries({ queryKey: ["search"] });
+      qc.invalidateQueries({ queryKey: keys.storage });
+    },
+  });
+}
+
+export function useFolders() {
+  return useQuery({ queryKey: [...keys.files, "folders"], queryFn: ({ signal }) => api("/files/folders", { signal }), select: (d) => d.folders, staleTime: 60_000 });
 }
 
 export function usePeople(all = false, hidden = false) {

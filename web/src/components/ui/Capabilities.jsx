@@ -1,13 +1,12 @@
-import { Brain, Cpu, Cloud, MagicWand, MapPin, Receipt, UserFocus } from "@phosphor-icons/react";
+import { Brain, Cpu, Cloud, MagicWand, MapPin, UserFocus } from "@phosphor-icons/react";
 import { useCapabilities } from "../../hooks/queries";
 import { Bezel } from "./Bezel";
 
 const FEATURES = [
   { key: "places", label: "Places", Icon: MapPin, api: "OpenStreetMap", local: "GeoNames, offline" },
   { key: "faces", label: "Faces", Icon: UserFocus, api: "—", local: "YuNet + SFace, on-device" },
-  { key: "understand", label: "Query understanding", Icon: Brain, api: "Gemini", local: "Rules, on-device" },
+  { key: "understand", label: "Query understanding", Icon: Brain, api: "Gemini", local: "Rules, on-device", llm: "Qwen3-0.6B + rules, on-device" },
   { key: "rerank", label: "Re-ranking", Icon: MagicWand, api: "Gemini vision", local: "SigLIP + MMR, on-device" },
-  { key: "ocr", label: "Receipt reading", Icon: Receipt, api: "Gemini", local: "off" },
 ];
 
 /** Which AI features use an API right now and which run locally. */
@@ -23,7 +22,7 @@ export function Capabilities() {
         <p className="text-sm text-bad">The ML service isn&apos;t reachable right now.</p>
       ) : (
         <ul className="divide-y divide-white/[0.05]">
-          {FEATURES.map(({ key, label, Icon, api, local }) => {
+          {FEATURES.map(({ key, label, Icon, api, local, llm }) => {
             const mode = data?.[key];
             const isApi = mode === "api";
             return (
@@ -33,7 +32,7 @@ export function Capabilities() {
                 </span>
                 <span className={`inline-flex items-center gap-1.5 text-xs ${mode ? "text-mist" : "text-haze"}`}>
                   {mode ? (isApi ? <Cloud size={13} /> : <Cpu size={13} />) : null}
-                  {!data ? "…" : mode ? (isApi ? api : local) : "off"}
+                  {!data ? "…" : mode ? (isApi ? api : mode === "llm" ? llm : local) : "off"}
                 </span>
               </li>
             );

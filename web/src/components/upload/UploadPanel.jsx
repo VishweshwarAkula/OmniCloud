@@ -1,8 +1,9 @@
-import { ArrowClockwise, CheckCircle, CloudArrowUp, Copy, ImageSquare, Plus, WarningCircle, X } from "@phosphor-icons/react";
+import { ArrowClockwise, CheckCircle, CloudArrowUp, Copy, FileText, FolderSimplePlus, ImageSquare, Plus, WarningCircle, X } from "@phosphor-icons/react";
 import { AnimatePresence, motion } from "motion/react";
 import { useRef } from "react";
 import { useProviders } from "../../hooks/queries";
 import { useUploads } from "../../hooks/useUploads";
+import { CANCELLABLE } from "../../lib/uploadStates";
 import { easeSpring } from "../../lib/motion";
 import { formatBytes } from "../../lib/format";
 import { providerMeta } from "../ui/Brand";
@@ -18,24 +19,30 @@ const STATUS = {
   done: { label: "Done", tone: "text-ok", Icon: CheckCircle },
   duplicate: { label: "Already in library", tone: "text-warn", Icon: Copy },
   error: { label: "Failed", tone: "text-bad", Icon: WarningCircle },
+  cancelling: { label: "Cancelling…", tone: "text-haze" },
   cancelled: { label: "Cancelled", tone: "text-haze" },
 };
 
 function Row({ item, onCancel, onRetry }) {
   const s = STATUS[item.status];
-  const busy = ["uploading", "queued", "processing", "indexing", "waiting"].includes(item.status);
+  const busy = ["uploading", "queued", "processing", "indexing", "waiting", "cancelling"].includes(item.status);
   const progress = item.status === "uploading" ? item.progress * 0.6 : { waiting: 0.05, queued: 0.65, processing: 0.75, indexing: 0.9 }[item.status] ?? 1;
   return (
     <li className="flex items-center gap-3 rounded-2xl p-2 transition hover:bg-white/[0.03]">
       <div className="relative h-12 w-12 shrink-0 overflow-hidden rounded-xl bg-white/[0.04] ring-1 ring-white/10">
         {item.preview ? (
           <img src={item.preview} alt="" className="h-full w-full object-cover" />
+        ) : /\.(pdf|docx|txt|md)$/i.test(item.file.name) ? (
+          <FileText size={20} weight="thin" className="absolute inset-0 m-auto text-mist" />
         ) : (
           <ImageSquare size={20} weight="thin" className="absolute inset-0 m-auto text-haze" />
         )}
       </div>
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm">{item.file.name}</p>
+        <p className="truncate text-sm" title={item.folder ? `${item.folder}/${item.file.name}` : item.file.name}>
+          {item.folder && <span className="text-haze">{item.folder}/</span>}
+          {item.file.name}
+        </p>
         <p className={`mt-0.5 flex items-center gap-1.5 text-xs ${s.tone}`}>
           {s.Icon && <s.Icon size={12} weight="fill" />}
           {item.status === "error" ? item.error : s.label}
@@ -50,8 +57,13 @@ function Row({ item, onCancel, onRetry }) {
           </div>
         )}
       </div>
-      {item.status === "uploading" && (
-        <button onClick={() => onCancel(item.id)} className="rounded-full p-2 text-haze transition hover:bg-white/5 hover:text-fog" aria-label={`Cancel ${item.file.name}`}>
+      {CANCELLABLE.includes(item.status) && (
+        <button
+          onClick={() => onCancel(item.id)}
+          className="rounded-full p-2 text-haze transition hover:bg-white/5 hover:text-bad"
+          aria-label={`Cancel ${item.file.name}`}
+          title="Cancel this upload"
+        >
           <X size={14} />
         </button>
       )}
@@ -68,8 +80,17 @@ export function UploadPanel() {
   const { items, add, cancel, retry, clearFinished, provider, setProvider, panelOpen, setPanelOpen } = useUploads();
   const { data: providers = [] } = useProviders();
   const input = useRef(null);
+  const folderInput = useRef(null);
   const connected = providers.filter((p) => p.connected);
   const active = items.filter((i) => !["done", "duplicate", "error", "cancelled"].includes(i.status)).length;
+  const cancellable = items.filter((i) => CANCELLABLE.includes(i.status));
+  const cancelAll = () => {
+    const onServer = cancellable.filter((i) => i.jobId).length;
+    const warning = onServer
+      ? `Cancel ${cancellable.length} uploads? ${onServer} already reached the server; anything they saved to your cloud will be removed.`
+      : `Cancel ${cancellable.length} uploads?`;
+    if (window.confirm(warning)) cancel(cancellable.map((i) => i.id));
+  };
   const selectedConnected = connected.some((p) => p.key === provider);
 
   return (
@@ -86,11 +107,18 @@ export function UploadPanel() {
           <div className="flex items-center justify-between px-5 pb-3 pt-5">
             <div>
               <h2 className="font-semibold tracking-tight">Uploads</h2>
-              <p className="text-xs text-mist">{active ? `${active} in progress` : items.length ? "All caught up" : "Drop images anywhere"}</p>
+              <p className="text-xs text-mist">{active ? `${active} in progress` : items.length ? "All caught up" : "Drop photos or documents anywhere"}</p>
             </div>
-            <button onClick={() => setPanelOpen(false)} className="rounded-full p-2 text-mist transition hover:bg-white/5 hover:text-fog" aria-label="Close uploads">
-              <X size={16} />
-            </button>
+            <div className="flex items-center gap-1">
+              {cancellable.length > 1 && (
+                <Button variant="quiet" size="sm" onClick={cancelAll}>
+                  Cancel all
+                </Button>
+              )}
+              <button onClick={() => setPanelOpen(false)} className="rounded-full p-2 text-mist transition hover:bg-white/5 hover:text-fog" aria-label="Close uploads">
+                <X size={16} />
+              </button>
+            </div>
           </div>
 
           <div className="px-5">
@@ -120,7 +148,7 @@ export function UploadPanel() {
             </div>
             {!selectedConnected && (
               <p className="mt-2 text-xs text-warn">
-                {connected.length ? "Pick a connected destination." : "Enable local storage or connect a cloud in Settings."}
+                {connected.length ? "Pick a connected destination." : "Connect a cloud in Settings first."}
               </p>
             )}
           </div>
@@ -135,7 +163,19 @@ export function UploadPanel() {
             <input
               ref={input}
               type="file"
-              accept="image/*,.heic,.heif"
+              accept="image/*,.heic,.heif,.pdf,.docx,.txt,.md"
+              multiple
+              hidden
+              onChange={(e) => {
+                add(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            {/* webkitdirectory picks a whole folder; each File carries its path inside it. */}
+            <input
+              ref={folderInput}
+              type="file"
+              webkitdirectory=""
               multiple
               hidden
               onChange={(e) => {
@@ -144,7 +184,10 @@ export function UploadPanel() {
               }}
             />
             <Button variant="primary" size="sm" leading={Plus} className="flex-1" disabled={!selectedConnected} onClick={() => input.current?.click()}>
-              Add images
+              Add files
+            </Button>
+            <Button size="sm" leading={FolderSimplePlus} disabled={!selectedConnected} onClick={() => folderInput.current?.click()}>
+              Add folder
             </Button>
             {items.length > active && (
               <Button variant="quiet" size="sm" onClick={clearFinished}>
@@ -177,7 +220,7 @@ export function DropOverlay({ visible }) {
           >
             <CloudArrowUp size={56} weight="thin" className="text-mint" />
             <p className="mt-6 text-2xl font-medium tracking-tight">Drop to upload</p>
-            <p className="mt-2 text-sm text-mist">Deduplicated, indexed for search, receipts totalled.</p>
+            <p className="mt-2 text-sm text-mist">Files or whole folders: photos and documents (PDF, DOCX, TXT, MD). Folders keep their structure in your cloud.</p>
           </motion.div>
         </motion.div>
       )}

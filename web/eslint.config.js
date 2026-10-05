@@ -18,7 +18,7 @@ export default [
     plugins: { "react-refresh": reactRefresh },
     rules: {
       "no-unused-vars": ["error", { varsIgnorePattern: "^[A-Z_]", argsIgnorePattern: "^_" }],
-      "react-refresh/only-export-components": ["warn", { allowConstantExport: true, allowExportNames: ["useAuth", "useToast", "useUploads", "useCommandPalette", "providerMeta"] }],
+      "react-refresh/only-export-components": ["warn", { allowConstantExport: true, allowExportNames: ["useAuth", "useToast", "useUploads", "useCommandPalette", "providerMeta", "matchLabel", "docType"] }],
     },
   },
 ];

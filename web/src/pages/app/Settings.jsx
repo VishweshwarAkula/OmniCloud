@@ -1,5 +1,5 @@
-import { CheckCircle, LinkBreak, Plugs, SignOut, WarningCircle } from "@phosphor-icons/react";
-import { useEffect } from "react";
+import { CheckCircle, LinkBreak, Plugs, WarningCircle } from "@phosphor-icons/react";
+import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router";
 import { providerMeta } from "../../components/ui/Brand";
 import { Bezel } from "../../components/ui/Bezel";
@@ -9,7 +9,8 @@ import { PipelineStatus } from "../../components/ui/PipelineStatus";
 import { Capabilities } from "../../components/ui/Capabilities";
 import { RevealGroup, RevealItem } from "../../components/ui/Reveal";
 import { useAuth } from "../../context/AuthContext";
-import { useConnectProvider, useDisconnectProvider, useProviders, useStorage } from "../../hooks/queries";
+import { useConnectProvider, useConnectWithCredentials, useDisconnectProvider, useProviders, useStorage } from "../../hooks/queries";
+import { Modal } from "../../components/ui/Modal";
 import { useToast } from "../../hooks/useToast";
 import { formatBytes, formatDate } from "../../lib/format";
 import { PageHeader } from "./PageHeader";
@@ -25,6 +26,7 @@ function ProviderCard({ provider, quota }) {
   const meta = providerMeta[provider.key];
   const connect = useConnectProvider();
   const disconnect = useDisconnectProvider();
+  const [askCredentials, setAskCredentials] = useState(false);
   const { toast } = useToast();
 
   return (
@@ -37,9 +39,7 @@ function ProviderCard({ provider, quota }) {
           <div>
             <h3 className="font-medium">{meta.label}</h3>
             <p className={`mt-0.5 flex items-center gap-1.5 text-xs ${provider.connected ? "text-ok" : "text-haze"}`}>
-              {provider.key === "local" ? (
-                <><CheckCircle size={12} weight="fill" /> Always available on this machine</>
-              ) : provider.connected ? (
+              {provider.connected ? (
                 <><CheckCircle size={12} weight="fill" /> Connected</>
               ) : provider.available ? (
                 "Not connected"
@@ -59,9 +59,7 @@ function ProviderCard({ provider, quota }) {
       )}
 
       <div className="mt-auto">
-        {provider.key === "local" ? (
-          <p className="text-xs text-haze">Files are kept in the server&apos;s <code className="font-mono">library</code> volume.</p>
-        ) : provider.connected ? (
+        {provider.connected ? (
           <Button
             variant="quiet"
             size="sm"
@@ -84,18 +82,67 @@ function ProviderCard({ provider, quota }) {
             leading={Plugs}
             disabled={!provider.available}
             loading={connect.isPending}
-            onClick={() => connect.mutate(provider.key, { onError: (e) => toast(e.message, { tone: "error" }) })}
+            onClick={() =>
+              provider.method === "credentials"
+                ? setAskCredentials(true)
+                : connect.mutate(provider.key, { onError: (e) => toast(e.message, { tone: "error" }) })
+            }
           >
             Connect {meta.label}
           </Button>
         )}
       </div>
+      {provider.method === "credentials" && (
+        <CredentialsDialog provider={provider} label={meta.label} open={askCredentials} onClose={() => setAskCredentials(false)} />
+      )}
     </Bezel>
   );
 }
 
+// Koofr: no developer app needed — the user pastes an app password generated in Koofr's settings.
+function CredentialsDialog({ provider, label, open, onClose }) {
+  const connect = useConnectWithCredentials();
+  const { toast } = useToast();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  return (
+    <Modal open={open} onClose={onClose} title={`Connect ${label}`} size="sm">
+      <form
+        className="space-y-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          connect.mutate(
+            { provider: provider.key, email, password },
+            {
+              onSuccess: () => {
+                toast(`${label} connected.`, { tone: "success" });
+                setPassword("");
+                onClose();
+              },
+              onError: (err) => toast(err.message, { tone: "error" }),
+            }
+          );
+        }}
+      >
+        <p className="text-sm text-mist">
+          In Koofr open{" "}
+          <a className="text-aqua underline" href="https://app.koofr.net/app/admin/preferences/password" target="_blank" rel="noopener noreferrer">
+            Preferences → Password → App passwords
+          </a>
+          , generate one named “OmniCloud”, and paste it here. Your normal Koofr password won&apos;t work.
+        </p>
+        <input className="field" type="email" required placeholder="Koofr email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="username" />
+        <input className="field" type="password" required placeholder="App password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="off" />
+        <Button type="submit" variant="primary" className="w-full" loading={connect.isPending}>
+          Connect
+        </Button>
+      </form>
+    </Modal>
+  );
+}
+
 export default function Settings() {
-  const { user, signOut } = useAuth();
+  const { user } = useAuth();
   const providers = useProviders();
   const anyConnected = providers.data?.some((p) => p.connected);
   const storage = useStorage(Boolean(anyConnected));
@@ -151,7 +198,6 @@ export default function Settings() {
             <p className="truncate text-sm text-mist">{user?.email}</p>
             <p className="mt-1 text-xs text-haze">Member since {formatDate(user?.createdAt)}</p>
           </div>
-          <Button variant="ghost" leading={SignOut} onClick={signOut}>Sign out</Button>
         </Bezel>
       </section>
     </>

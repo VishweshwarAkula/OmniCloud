@@ -3,6 +3,8 @@ import { motion, useReducedMotion } from "motion/react";
 import { useState } from "react";
 import { easeSpring } from "../../lib/motion";
 import { ProviderBadge } from "../ui/Brand";
+import { MatchBadge } from "../ui/MatchBadge";
+import { DocumentCard } from "./DocumentCard";
 import { Skeleton } from "../ui/Feedback";
 
 function Tile({ item, index, onOpen }) {
@@ -12,6 +14,19 @@ function Tile({ item, index, onOpen }) {
   const indexing = item.status === "indexing";
   // Known dimensions reserve the right box before the image arrives (no layout shift).
   const ratio = item.width && item.height ? `${item.width} / ${item.height}` : undefined;
+
+  if (item.mediaType === "document") {
+    return (
+      <motion.li
+        className="mb-3 break-inside-avoid sm:mb-4"
+        initial={reduce ? false : { opacity: 0, y: 24 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.7, delay: Math.min(index % 30, 12) * 0.035, ease: easeSpring }}
+      >
+        <DocumentCard item={item} onOpen={onOpen} />
+      </motion.li>
+    );
+  }
 
   return (
     <motion.li
@@ -46,7 +61,7 @@ function Tile({ item, index, onOpen }) {
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-ink/70 via-transparent opacity-0 transition duration-500 group-hover:opacity-100" />
           <div className="absolute inset-x-2 bottom-2 flex items-center justify-between opacity-0 transition duration-500 ease-[var(--ease-spring)] group-hover:opacity-100 group-focus-visible:opacity-100">
             <ProviderBadge provider={item.provider} />
-            {item.score != null && <span className="rounded-full bg-ink/85 px-2 py-1 font-mono text-[10px] text-mint ring-1 ring-mint/30">{Math.round(item.score * 100)}%</span>}
+            <MatchBadge match={item.match} />
           </div>
           {indexing && (
             <span className="absolute left-2 top-2 inline-flex items-center gap-1 rounded-full bg-ink/85 px-2 py-1 text-[10px] text-mint ring-1 ring-mint/30">
