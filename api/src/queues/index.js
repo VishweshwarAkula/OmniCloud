@@ -2,24 +2,24 @@
   Ingest pipeline — staged competing consumers on BullMQ.
 
         ┌─ upload  (I/O: provider API)            ─┐
-        ├─ embed   (CPU: SigLIP 2, tags, place)    ─┤
-  flow ─┼─ faces   (CPU: detect + cluster)         ─┼─► finalize (DB rows, bloom, cleanup)
-        └─ ocr     (rate-limited: Gemini, optional) ─┘
+  flow ─┼─ embed   (CPU: SigLIP 2, tags, place)    ─┼─► finalize (DB rows, bloom, cleanup)
+        └─ faces   (CPU: detect + cluster)         ─┘
+  documents: upload + docindex (extract, chunk, embed text) ─► finalize
 
   Each stage has its own queue so it can be tuned (concurrency, rate limit, retries) and
   scaled independently; any number of worker replicas compete for jobs. The parent
-  `finalize` job runs only once its children finish. `ocr` is optional: its failure is
+  `finalize` job runs only once its children finish. `faces` is optional: its failure is
   ignored, while `upload`/`embed` failures fail the whole flow.
 */
 import { FlowProducer, Queue } from "bullmq";
-import { facesEnabled, ocrEnabled } from "../config.js";
+import { facesEnabled } from "../config.js";
 import { createRedis, redis } from "../lib/redis.js";
 
 export const Q = {
   upload: "omni-upload",
   embed: "omni-embed",
-  ocr: "omni-ocr",
   faces: "omni-faces",
+  docindex: "omni-docs",
   finalize: "omni-finalize",
 };
 
@@ -31,8 +31,8 @@ const retention = { removeOnComplete: { age: 3600, count: 5000 }, removeOnFail: 
 const stageOpts = {
   upload: { attempts: 5, backoff: { type: "exponential", delay: 3_000 }, failParentOnFailure: true },
   embed: { attempts: 4, backoff: { type: "exponential", delay: 5_000 }, failParentOnFailure: true },
-  ocr: { attempts: 3, backoff: { type: "exponential", delay: 10_000 }, ignoreDependencyOnFailure: true },
   faces: { attempts: 3, backoff: { type: "exponential", delay: 5_000 }, ignoreDependencyOnFailure: true },
+  docindex: { attempts: 3, backoff: { type: "exponential", delay: 5_000 }, failParentOnFailure: true },
 };
 
 // BullMQ forbids ':' in custom ids. One flow per (user, content hash) dedupes in-flight uploads.
@@ -43,6 +43,7 @@ const pendingKey = (userId) => `omni:pending:${userId}`;
 // so one user's 500-file batch interleaves with everyone else's instead of blocking them.
 export async function enqueueIngest(data) {
   const id = flowId(data.userId, data.fileHash);
+  await redis.del(releasedKey(id)); // a new flow for this file releases its own slot once
   const [[, pending]] = await redis.multi().incr(pendingKey(data.userId)).expire(pendingKey(data.userId), 86_400).exec();
   const priority = Math.min(2_097_151, Math.max(1, pending));
 
@@ -51,8 +52,12 @@ export async function enqueueIngest(data) {
     queueName: Q.finalize,
     data,
     opts: { jobId: id, priority, attempts: 5, backoff: { type: "exponential", delay: 2_000 }, ...retention },
-    // Optional stages are only added when enabled (a no-op OCR job would still burn the shared rate limit).
-    children: ["upload", "embed", ...(facesEnabled ? ["faces"] : []), ...(ocrEnabled ? ["ocr"] : [])].map((stage) => ({
+    // Optional stages are only added when enabled.
+    // Documents get text indexing instead of the image stages.
+    children: (data.mediaType === "document"
+      ? ["upload", "docindex"]
+      : ["upload", "embed", ...(facesEnabled ? ["faces"] : [])]
+    ).map((stage) => ({
       name: stage,
       queueName: Q[stage],
       data,
@@ -65,6 +70,23 @@ export async function enqueueIngest(data) {
 export async function releasePending(userId) {
   const left = await redis.decr(pendingKey(userId));
   if (left < 0) await redis.set(pendingKey(userId), 0, "EX", 86_400);
+}
+
+// Exactly once per flow, whichever way it ends (finalize, failure, cancel, or several of them).
+const releasedKey = (id) => `omni:released:${id}`;
+export async function releaseFlow(userId, fileHash) {
+  if (await redis.set(releasedKey(flowId(userId, fileHash)), "1", "EX", 86_400, "NX")) await releasePending(userId);
+}
+
+// "completed" | "failed" | "active" | ... | "missing" for the flow's parent (finalize) job.
+export async function flowState(userId, fileHash) {
+  const parent = await queues.finalize.getJob(flowId(userId, fileHash));
+  return parent ? parent.getState() : "missing";
+}
+
+export async function stageState(userId, fileHash, stage) {
+  const job = await queues[stage].getJob(`${flowId(userId, fileHash)}-${stage}`);
+  return job ? job.getState() : "missing";
 }
 
 async function stateOf(queue, id) {

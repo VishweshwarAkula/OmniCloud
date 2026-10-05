@@ -2,6 +2,7 @@ import dns from "node:dns/promises";
 import net from "node:net";
 import { config } from "../config.js";
 import { HttpError } from "../lib/errors.js";
+import { Agent } from "undici";
 
 const headers = () => (config.ML_SERVICE_TOKEN ? { "X-Service-Token": config.ML_SERVICE_TOKEN } : {});
 
@@ -26,6 +27,10 @@ async function mlAddresses() {
   return dnsCache.addrs.length ? dnsCache.addrs : [mlUrl.hostname];
 }
 
+// fetch gives up after 5 minutes without response headers (undici's headersTimeout), whatever the
+// AbortSignal says. Long calls (indexing a 900-page book) get a dispatcher that waits as long as they may.
+const longCalls = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+
 async function call(path, init, timeout = 60_000) {
   const addrs = [...(await mlAddresses())].sort(() => Math.random() - 0.5);
   let lastErr;
@@ -37,6 +42,7 @@ async function call(path, init, timeout = 60_000) {
         ...init,
         headers: { ...headers(), ...init.headers },
         signal: AbortSignal.timeout(timeout),
+        ...(timeout > 240_000 && { dispatcher: longCalls }),
       });
       if (res.status === 503) {
         lastErr = new HttpError(503, "ML replica not ready", "ml_unavailable");
@@ -68,6 +74,15 @@ function imageForm({ userId, fileHash, buffer, mime, name, filename }) {
 export const embedImage = (args) => call("/embed", { method: "POST", body: imageForm(args) }, 120_000);
 export const detectFaces = (args) => call("/faces", { method: "POST", body: imageForm(args) }, 120_000);
 
+export function indexDocument({ userId, fileHash, buffer, mime, filename }) {
+  const body = new FormData();
+  body.set("file", new Blob([buffer], { type: mime }), filename);
+  body.set("user_id", userId);
+  body.set("file_hash", fileHash);
+  body.set("filename", filename.slice(0, 512));
+  return call("/documents/index", { method: "POST", body }, 30 * 60_000); // ~1,600 chunks (900 pages) take minutes on CPU
+}
+
 const json = (path, body, timeout) =>
   call(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, timeout);
 
@@ -83,7 +98,6 @@ export async function capabilities() {
   capsCache = { at: Date.now(), value: { model: info.model, ...info.capabilities } };
   return capsCache.value;
 }
-export const readReceipt = (args) => call("/ocr", { method: "POST", body: imageForm(args) }, 90_000);
 
 export const modelInfo = () => call("/healthz", { method: "GET" }, 10_000);
 

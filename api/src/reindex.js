@@ -1,4 +1,5 @@
-// Re-embeds stored files with the ML service's current model (run after changing EMBED_MODEL_NAME).
+// Re-embeds stored files with the ML service's current model (run after changing EMBED_MODEL_NAME),
+// and indexes documents whose first indexing failed.
 //   docker compose run --rm api node src/reindex.js          # only files embedded with another model
 //   docker compose run --rm api node src/reindex.js --all    # everything
 // Jobs go through the normal embed queue at low priority, so live uploads stay fast and the
@@ -13,7 +14,7 @@ import { modelInfo } from "./services/ml.js";
 const all = process.argv.includes("--all");
 const { model } = await modelInfo();
 const rows = await query(
-  `select id from files where status <> 'failed' and provider_file_id is not null
+  `select id from files where status <> 'failed' and provider_file_id is not null and media_type = 'image'
    ${all ? "" : "and embed_model is distinct from $1"} order by created_at desc`,
   all ? [] : [model]
 );
@@ -36,7 +37,7 @@ await queues.embed.addBulk(
 let faceJobs = 0;
 if (facesEnabled) {
   const unscanned = await query(
-    `select id from files where status <> 'failed' and provider_file_id is not null ${all ? "" : "and not faces_scanned"}`
+    `select id from files where status <> 'failed' and provider_file_id is not null and media_type = 'image' ${all ? "" : "and not faces_scanned"}`
   );
   await queues.faces.addBulk(
     unscanned.map((r) => ({
@@ -47,5 +48,16 @@ if (facesEnabled) {
   );
   faceJobs = unscanned.length;
 }
-logger.info({ model, embedJobs: rows.length, faceJobs, all }, "reindex queued");
+// Documents never indexed (their first indexing failed): finalize always sets a title.
+const docs = await query(
+  `select id from files where status <> 'failed' and provider_file_id is not null and media_type = 'document' ${all ? "" : "and title is null"}`
+);
+await queues.docindex.addBulk(
+  docs.map((r) => ({
+    name: "reindex",
+    data: { fileId: r.id },
+    opts: { jobId: `docs-${r.id}-${Date.now()}`, priority: 100_000, attempts: 3, backoff: { type: "exponential", delay: 5_000 }, removeOnComplete: { age: 3600, count: 5000 }, removeOnFail: { age: 7 * 86_400 } },
+  }))
+);
+logger.info({ model, embedJobs: rows.length, faceJobs, docJobs: docs.length, all }, "reindex queued");
 await Promise.allSettled([closeQueues(), redis.quit(), pool.end()]);

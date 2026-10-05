@@ -37,4 +37,6 @@ router.get(
   asyncRoute(async (_req, res) => res.json(await capabilities().catch(() => ({ unavailable: true }))))
 );
 
+router.get("/me", requireAuth, (req, res) => res.json({ user: req.user }));
+
 export default router;

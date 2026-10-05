@@ -3,7 +3,8 @@ import { asyncRoute, HttpError } from "../lib/errors.js";
 import { redis } from "../lib/redis.js";
 import { requireAuth } from "../middleware/auth.js";
 import { mergeFaces } from "../services/ml.js";
-import { listPeople, mergePeople, renamePerson, setHidden } from "../services/people.js";
+import { assertOwnPeople, facesLock, listPeople, mergePeople, updatePerson } from "../services/people.js";
+import { withLock } from "../lib/redis.js";
 
 const router = Router();
 const uuid = (v) => typeof v === "string" && /^[0-9a-f-]{36}$/i.test(v);
@@ -22,8 +23,11 @@ router.patch(
   requireAuth,
   asyncRoute(async (req, res) => {
     if (!uuid(req.params.id)) throw new HttpError(400, "Bad person id.");
-    if ("name" in (req.body ?? {})) await renamePerson(req.user.id, req.params.id, req.body.name);
-    if ("hidden" in (req.body ?? {})) await setHidden(req.user.id, req.params.id, Boolean(req.body.hidden));
+    const body = req.body ?? {};
+    await updatePerson(req.user.id, req.params.id, {
+      ...("name" in body && { name: body.name }),
+      ...("hidden" in body && { hidden: Boolean(body.hidden) }),
+    });
     await forgetSearchContext(req.user.id);
     res.json({ ok: true });
   })
@@ -37,9 +41,14 @@ router.post(
     const target = req.params.id;
     const sources = Array.isArray(req.body?.sources) ? req.body.sources.filter(uuid).slice(0, 50) : [];
     if (!uuid(target) || !sources.length) throw new HttpError(400, "Pick at least one person to merge.");
-    // Face index first, so future faces of the merged clusters keep landing on the target.
-    await mergeFaces({ userId: req.user.id, sources, target });
-    const merged = await mergePeople(req.user.id, target, sources);
+    // Validate before touching anything, so a bad request can't change the face index alone.
+    await assertOwnPeople(req.user.id, [target, ...sources]);
+    // Same lock as face clustering: no face can be assigned to a source mid-merge. Face index
+    // first, so future faces of the merged clusters keep landing on the target.
+    const merged = await withLock(facesLock(req.user.id), async () => {
+      await mergeFaces({ userId: req.user.id, sources, target });
+      return mergePeople(req.user.id, target, sources);
+    });
     await forgetSearchContext(req.user.id);
     res.json({ ok: true, merged: merged.length });
   })

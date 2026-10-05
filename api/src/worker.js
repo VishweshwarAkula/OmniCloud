@@ -8,15 +8,16 @@ import os from "node:os";
 import path from "node:path";
 import { UnrecoverableError, Worker } from "bullmq";
 import { config } from "./config.js";
-import { pool, PROVIDER_KEYS, query } from "./db/index.js";
+import { pool, PROVIDER_KEYS } from "./db/index.js";
 import { HttpError, ProviderAuthError } from "./lib/errors.js";
 import { logger } from "./lib/logger.js";
-import { bloomAdd, createRedis, ensureBloom, redis } from "./lib/redis.js";
+import { bloomAdd, createRedis, ensureBloom, redis, withLock } from "./lib/redis.js";
 import { invalidateUserCaches, withAccessToken } from "./providers/index.js";
-import { closeQueues, Q, releasePending } from "./queues/index.js";
+import { closeQueues, flowState, Q, releaseFlow, stageState } from "./queues/index.js";
 import { findByHash, getFile, metadataPatch, updateFile, upsertFile } from "./services/files.js";
-import { deleteFromIndex, detectFaces, embedImage, readReceipt } from "./services/ml.js";
-import { storeFaces } from "./services/people.js";
+import { deleteFromIndex, detectFaces, embedImage, indexDocument } from "./services/ml.js";
+import { facesLock, storeFaces } from "./services/people.js";
+import { cleanupCancelled, isCancelled } from "./services/removal.js";
 
 await ensureBloom();
 
@@ -24,7 +25,7 @@ const readStaged = (d) =>
   fs.readFile(d.tmpPath).catch(() => {
     throw new UnrecoverableError("Staged upload is missing");
   });
-const storedName = (d) => `${d.fileHash}${d.ext}`;
+const storedName = (d) => d.cloudName || `${d.fileHash}${d.ext}`;
 
 // Each stage is idempotent, so retries and duplicate deliveries are harmless.
 const processors = {
@@ -32,10 +33,18 @@ const processors = {
     const d = job.data;
     const existing = await findByHash(d.userId, d.fileHash);
     if (existing?.provider_file_id) return { fileId: existing.id, skipped: true };
-    const buffer = await readStaged(d);
-    const uploaded = await withAccessToken(d.userId, d.provider, (at, p) =>
-      p.upload(at, { name: storedName(d), mime: d.mime, buffer, userId: d.userId })
-    );
+    // The cloud upload and the DB insert can't be one transaction, so the cloud id is recorded on
+    // the job the moment the upload succeeds: a retry (crash, DB error) reuses it instead of
+    // uploading a second copy, and failure/cancel handlers can still find and remove it.
+    let uploaded = d.uploaded;
+    if (!uploaded) {
+      const buffer = await readStaged(d);
+      const res = await withAccessToken(d.userId, d.provider, (at, p) =>
+        p.upload(at, { name: storedName(d), folder: d.folder ?? [], mime: d.mime, buffer, userId: d.userId, hash: d.fileHash })
+      );
+      uploaded = { id: res.id, name: res.name };
+      await job.updateData({ ...d, uploaded });
+    }
     const row = await upsertFile({
       user_id: d.userId,
       file_hash: d.fileHash,
@@ -45,9 +54,32 @@ const processors = {
       mime: d.mime,
       size: d.size,
       status: "indexing",
+      // Known now, not at finalize: a file whose indexing fails must still show up as what it is.
+      media_type: d.mediaType === "document" ? "document" : "image",
+      folder: (d.folder ?? []).join("/"),
     });
     await invalidateUserCaches(d.userId, d.provider);
+    // A sibling stage already failed the flow, so finalize will never run: settle the file here
+    // (stored in the cloud, shown in the library, just not searchable).
+    if ((await flowState(d.userId, d.fileHash)) === "failed") {
+      await updateFile(row.id, { status: "ready" });
+      await fs.unlink(d.tmpPath).catch(() => {});
+    }
     return { fileId: row.id };
+  },
+
+  // Documents: extract → chunk → embed text (ML service), instead of the image stages.
+  async docindex(job) {
+    if (job.name === "reindex") return reindexDocument(job);
+    const d = job.data;
+    const res = await indexDocument({
+      userId: d.userId,
+      fileHash: d.fileHash,
+      buffer: await readStaged(d),
+      mime: d.mime,
+      filename: d.originalName || storedName(d),
+    });
+    return { document: res };
   },
 
   async embed(job) {
@@ -67,13 +99,12 @@ const processors = {
   async faces(job) {
     if (job.name === "reindex") return reindexFaces(job);
     const d = job.data;
-    const res = await detectFaces({ userId: d.userId, fileHash: d.fileHash, buffer: await readStaged(d), mime: d.mime, name: storedName(d) });
+    const buffer = await readStaged(d);
+    // Clustering reads then writes the face index: serialized per user across all replicas.
+    const res = await withLock(facesLock(d.userId), () =>
+      detectFaces({ userId: d.userId, fileHash: d.fileHash, buffer, mime: d.mime, name: storedName(d) })
+    );
     return { faces: res.faces };
-  },
-
-  async ocr(job) {
-    const d = job.data;
-    return readReceipt({ buffer: await readStaged(d), mime: d.mime, name: storedName(d) });
   },
 
   async finalize(job) {
@@ -81,34 +112,35 @@ const processors = {
     const values = await job.getChildrenValues();
     const pick = (queue) => Object.entries(values).find(([k]) => k.includes(`:${queue}:`))?.[1];
     const embedded = pick(Q.embed);
-    const receipt = pick(Q.ocr);
     const faces = pick(Q.faces);
+    const doc = pick(Q.docindex)?.document;
 
     const row = await findByHash(d.userId, d.fileHash);
     if (!row) throw new Error("file row missing after upload stage");
-    await updateFile(row.id, {
-      weaviate_id: embedded?.weaviateId ?? null,
-      status: "ready",
-      ...metadataPatch(embedded?.metadata, embedded?.model),
-    });
+    if (d.mediaType === "document") {
+      await updateFile(row.id, {
+        status: "ready",
+        media_type: "document",
+        kind: "document",
+        title: doc?.title ?? d.originalName ?? null,
+        page_count: doc?.page_count ?? null,
+        excerpt: doc?.excerpt ?? null,
+      });
+    } else {
+      await updateFile(row.id, {
+        weaviate_id: embedded?.weaviateId ?? null,
+        status: "ready",
+        ...metadataPatch(embedded?.metadata, embedded?.model),
+      });
+    }
 
     if (faces) await storeFaces(d.userId, row.id, faces.faces ?? []);
-
-    if (receipt?.is_receipt && receipt.total != null) {
-      await query(
-        `insert into receipts (user_id, file_id, total, currency, vendor, receipt_date, confidence, raw)
-         values ($1, $2, $3, $4, $5, $6, $7, $8)
-         on conflict (file_id) do update set total = excluded.total, currency = excluded.currency,
-           vendor = excluded.vendor, receipt_date = excluded.receipt_date, confidence = excluded.confidence, raw = excluded.raw`,
-        [d.userId, row.id, receipt.total, receipt.currency, receipt.vendor, isoDate(receipt.date), receipt.confidence, receipt]
-      );
-    }
 
     // Only fully ingested files enter the bloom filter, so failures stay retryable.
     await bloomAdd(`${d.userId}:${d.fileHash}`);
     await fs.unlink(d.tmpPath).catch(() => {});
-    await releasePending(d.userId);
-    return { fileId: row.id, receipt: Boolean(receipt?.is_receipt) };
+    await releaseFlow(d.userId, d.fileHash);
+    return { fileId: row.id, kind: embedded?.metadata?.kind ?? null };
   },
 };
 
@@ -134,57 +166,88 @@ async function reindex(job) {
   return { fileId: row.id, model: res.model };
 }
 
+// Index an already stored document (e.g. one whose first indexing failed): bytes come from its provider.
+async function reindexDocument(job) {
+  const row = await getFile(job.data.fileId);
+  if (!row?.provider_file_id) return { skipped: true };
+  const doc = await indexDocument({
+    userId: row.user_id,
+    fileHash: row.file_hash,
+    buffer: await storedBytes(row),
+    mime: row.mime || "application/octet-stream",
+    filename: row.name,
+  });
+  await updateFile(row.id, { status: "ready", title: doc.title ?? row.name, page_count: doc.page_count ?? null, excerpt: doc.excerpt ?? null });
+  return { fileId: row.id, chunks: doc.chunks };
+}
+
 // Scan an already stored file for faces (files uploaded before faces were enabled).
 async function reindexFaces(job) {
   const row = await getFile(job.data.fileId);
   if (!row?.provider_file_id) return { skipped: true };
-  const res = await detectFaces({
-    userId: row.user_id,
-    fileHash: row.file_hash,
-    buffer: await storedBytes(row),
-    mime: row.mime || "image/jpeg",
-    name: `${row.file_hash}.img`,
-  });
+  const buffer = await storedBytes(row);
+  const res = await withLock(facesLock(row.user_id), () =>
+    detectFaces({ userId: row.user_id, fileHash: row.file_hash, buffer, mime: row.mime || "image/jpeg", name: `${row.file_hash}.img` })
+  );
   await storeFaces(row.user_id, row.id, res.faces);
   return { fileId: row.id, faces: res.faces.length };
-}
-
-function isoDate(v) {
-  return typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v)) ? v : null;
 }
 
 const stageSettings = {
   upload: { concurrency: config.UPLOAD_CONCURRENCY },
   embed: { concurrency: config.EMBED_CONCURRENCY },
-  ocr: { concurrency: config.OCR_CONCURRENCY, limiter: { max: config.OCR_RATE_PER_MINUTE, duration: 60_000 } },
   faces: { concurrency: config.EMBED_CONCURRENCY },
+  docindex: { concurrency: config.DOCINDEX_CONCURRENCY },
   finalize: { concurrency: config.FINALIZE_CONCURRENCY },
 };
 
-// A flow failed for good: clean up so nothing is left half-done.
+/*
+  A stage failed for good. Sibling stages keep running after the flow fails, and several of them
+  can end up here, so every step is idempotent and order-independent:
+    - the pending slot is released once per flow (releaseFlow)
+    - the staged file is deleted only once the upload stage no longer needs it (otherwise the
+      upload stage deletes it itself when it sees the failed flow)
+    - an upload that reached the cloud but never got its row is removed from the cloud again
+*/
 async function onFinalFailure(stage, job) {
   const d = job.data;
-  if (stage === "ocr" || stage === "faces" || job.name === "reindex") return; // optional / standalone
-  await fs.unlink(d.tmpPath).catch(() => {});
-  await releasePending(d.userId);
+  if (job.name === "reindex") return; // standalone
+  if (await isCancelled(d.userId, d.fileHash)) return cleanupCancelled(d);
+  if (stage === "faces") return; // optional: its failure doesn't fail the flow
+  await releaseFlow(d.userId, d.fileHash);
   const row = await findByHash(d.userId, d.fileHash).catch(() => null);
   if (stage === "upload") {
+    await fs.unlink(d.tmpPath).catch(() => {});
     await deleteFromIndex({ userId: d.userId, fileHash: d.fileHash }).catch(() => {});
+    if (d.uploaded && !row?.provider_file_id) {
+      await withAccessToken(d.userId, d.provider, (at, p) => p.remove(at, d.uploaded.id)).catch((err) =>
+        logger.warn({ err: err.message, jobId: job.id }, "orphaned cloud copy could not be removed")
+      );
+    }
     if (row && !row.provider_file_id) await updateFile(row.id, { status: "failed" }).catch(() => {});
-  } else if (row?.status === "indexing") {
-    // Stored in the cloud but not searchable: still show it in the library.
-    await updateFile(row.id, { status: "ready" }).catch(() => {});
+    return;
   }
+  if (["completed", "failed", "missing"].includes(await stageState(d.userId, d.fileHash, "upload"))) {
+    await fs.unlink(d.tmpPath).catch(() => {});
+  }
+  // Stored in the cloud but not searchable: still show it in the library.
+  if (row?.status === "indexing") await updateFile(row.id, { status: "ready" }).catch(() => {});
 }
 
-const enabled = (process.env.WORKER_QUEUES || "upload,embed,faces,ocr,finalize").split(",").map((s) => s.trim()).filter((s) => processors[s]);
+const enabled = (process.env.WORKER_QUEUES || "upload,embed,faces,docindex,finalize").split(",").map((s) => s.trim()).filter((s) => processors[s]);
 
 const workers = enabled.map((stage) => {
   const worker = new Worker(
     Q[stage],
     async (job) => {
+      // Cancelled uploads stop at the next stage boundary: before starting, and right after a stage
+      // (so a file that just reached the cloud is removed again by the failure handler).
+      const cancelled = () => job.name !== "reindex" && isCancelled(job.data.userId, job.data.fileHash);
+      if (await cancelled()) throw new UnrecoverableError("Cancelled");
       try {
-        return await processors[stage](job);
+        const result = await processors[stage](job);
+        if (await cancelled()) throw new UnrecoverableError("Cancelled");
+        return result;
       } catch (err) {
         // Auth and validation problems won't fix themselves on retry.
         if (err instanceof ProviderAuthError || (err instanceof HttpError && err.status < 500 && err.status !== 429)) {

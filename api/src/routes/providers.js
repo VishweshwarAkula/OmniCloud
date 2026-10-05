@@ -27,6 +27,7 @@ router.get(
         key: p.key,
         label: p.label,
         available: providerConfigured[p.key],
+        method: p.credentials ? "credentials" : "oauth",
         connected: connected.has(p.key),
       })),
     });
@@ -72,7 +73,7 @@ router.post(
   requireAuth,
   asyncRoute(async (req, res) => {
     const provider = getProvider(req.params.provider);
-    if (provider.local) throw new HttpError(400, "Local disk needs no connection.");
+    if (provider.credentials) throw new HttpError(400, `${provider.label} connects with an app password, not OAuth.`);
     const state = crypto.randomBytes(24).toString("base64url");
     await redis.set(`omni:oauth:${state}`, JSON.stringify({ userId: req.user.id, provider: provider.key }), "EX", STATE_TTL);
     res.json({ url: provider.authorizeUrl(state) });
@@ -95,7 +96,7 @@ router.get(
 
     try {
       const provider = getProvider(pending.provider);
-      const { refreshToken } = await provider.exchangeCode(code);
+      const { refreshToken } = await provider.exchangeCode(code, req.query); // pCloud adds its data-centre hostname
       if (!refreshToken) return back("error", "&reason=no_refresh_token");
       await saveRefreshToken(pending.userId, provider.key, refreshToken);
       back("success");
@@ -106,12 +107,24 @@ router.get(
   })
 );
 
+// Providers connected with credentials instead of OAuth (Koofr: email + app password).
+router.post(
+  "/providers/:provider/credentials",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const provider = getProvider(req.params.provider);
+    if (!provider.credentials) throw new HttpError(400, `${provider.label} connects through its own sign-in page.`);
+    const credential = await provider.verify({ email: String(req.body?.email ?? "").trim(), password: String(req.body?.password ?? "") });
+    await saveRefreshToken(req.user.id, provider.key, credential);
+    res.json({ ok: true });
+  })
+);
+
 router.post(
   "/providers/:provider/disconnect",
   requireAuth,
   asyncRoute(async (req, res) => {
     const provider = getProvider(req.params.provider);
-    if (provider.local) throw new HttpError(400, "Local disk can't be disconnected; disable it with LOCAL_STORAGE=false.");
     const refreshToken = await getRefreshToken(req.user.id, provider.key);
     if (!refreshToken) throw new HttpError(404, `${provider.label} is not connected.`);
     // Revocation is best effort; we always forget the token locally.

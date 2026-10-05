@@ -26,7 +26,6 @@ const DOWN_DELAY = num("SCALE_DOWN_DELAY_MS", 90_000);
 const rules = [
   {
     service: "worker",
-    // OCR is excluded: it's capped by a queue-wide rate limit, so extra replicas can't drain it faster.
     queues: ["upload", "embed", "faces", "finalize"],
     target: num("WORKER_TARGET_BACKLOG", 20),
     min: num("WORKER_MIN", 1),
