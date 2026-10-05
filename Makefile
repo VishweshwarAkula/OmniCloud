@@ -14,14 +14,14 @@ env:             ## Create .env from the example with fresh secrets
 	          s/^URL_SIGNING_SECRET=$$/URL_SIGNING_SECRET=$$(openssl rand -hex 32)/; \
 	          s/^ML_SERVICE_TOKEN=$$/ML_SERVICE_TOKEN=$$(openssl rand -hex 24)/; \
 	          s/^POSTGRES_PASSWORD=$$/POSTGRES_PASSWORD=$$(openssl rand -hex 16)/" .env && \
-	  echo "Created .env. Add GOOGLE_CLIENT_ID/SECRET, or set DEV_LOGIN=true to try it locally.")
+	  echo "Created .env with fresh secrets. Connect clouds in Settings (see README for OAuth keys).")
 
 data:            ## Create data dirs (owned by you, so the uid-1000 app user can write uploads)
-	@mkdir -p $(DATA_DIR)/postgres $(DATA_DIR)/redis $(DATA_DIR)/weaviate $(DATA_DIR)/uploads $(DATA_DIR)/library
+	@mkdir -p $(DATA_DIR)/postgres $(DATA_DIR)/redis $(DATA_DIR)/weaviate $(DATA_DIR)/uploads
 
 up: env data     ## Build and start the full local stack
 	docker compose up --build -d
-	@echo "→ http://localhost:$${WEB_PORT:-8080}"
+	@echo "→ http://localhost:$$(grep -s '^WEB_PORT=' .env | cut -d= -f2 || echo 8080)"
 
 down:            ## Stop everything (data volumes are kept)
 	docker compose down --remove-orphans
@@ -50,13 +50,15 @@ redis-cli:       ## Open redis-cli
 test:            ## Run all test suites
 	cd api && npm test
 	cd web && npm test
-	cd ml && python -m pytest -q
+	docker compose run --rm --no-deps -u root -v $$PWD/ml/tests:/srv/tests -v $$PWD/ml/requirements-dev.txt:/tmp/dev.txt \
+	  --entrypoint sh ml -c "pip install -q -r /tmp/dev.txt && python -m pytest -q -p no:cacheprovider tests"
 
 lint:            ## Lint everything
 	cd api && npm run lint
 	cd web && npm run lint
-	cd ml && ruff check app tests scripts
+	docker compose run --rm --no-deps -u root -v $$PWD/ml:/src -v $$PWD/ml/requirements-dev.txt:/tmp/dev.txt \
+	  --entrypoint sh ml -c "pip install -q -r /tmp/dev.txt && cd /src && ruff check --no-cache app tests scripts"
 
-reset:           ## DANGER: stop and delete ALL local data (db, redis, vectors, uploads, library)
+reset:           ## DANGER: stop the stack; prints how to wipe local data (db, redis, vectors, uploads)
 	docker compose down --remove-orphans
 	@echo "Delete $(DATA_DIR) to wipe all data:  rm -rf $(DATA_DIR)"

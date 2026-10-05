@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OmniCloud – Privacy policy</title>
+  <style>
+    body { font: 16px/1.6 system-ui, sans-serif; max-width: 42rem; margin: 3rem auto; padding: 0 1rem; color: #1c1c1c; }
+    h2 { margin-top: 2rem; } .muted { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Privacy policy</h1>
+  <p class="muted">Last updated: October 2026</p>
+
+  <h2>What OmniCloud is</h2>
+  <p>OmniCloud is a self-hosted application that runs only on the user's own computer. There is no OmniCloud
+  server operated by us: we do not receive, store or process your files or personal data.</p>
+
+  <h2>Google user data we access</h2>
+  <p>If you connect Google Drive, OmniCloud requests the <code>https://www.googleapis.com/auth/drive.file</code>
+  scope. This lets it create, read and delete <strong>only files that OmniCloud itself uploads</strong> to your
+  Drive (inside an "OmniCloud" folder). It cannot see any other files in your Drive.</p>
+
+  <h2>How the data is used</h2>
+  <ul>
+    <li>Files are uploaded to your Drive when you choose Google Drive as the destination, and read back to show
+      them in your library.</li>
+    <li>To make photos and documents searchable, OmniCloud analyses them <strong>on your own computer</strong>
+      (image and text models running locally) and stores the resulting search index on your computer.</li>
+    <li>OmniCloud also reads your Drive's storage quota to show how much space is left.</li>
+  </ul>
+
+  <h2>Storage and security</h2>
+  <p>The Google authorization token is stored encrypted (AES-256-GCM) in a database on your computer. The app
+  is only reachable from that computer (it listens on 127.0.0.1).</p>
+
+  <h2>Sharing</h2>
+  <p>Google user data is not sold, shared with third parties, or used for advertising. Optional: if <em>you</em>
+  configure your own Google Gemini API key in OmniCloud, search queries and small image thumbnails may be sent
+  to Google's Gemini API to improve search; without a key, nothing leaves your computer except calls to the
+  storage services you connected.</p>
+
+  <h2>Limited Use</h2>
+  <p>OmniCloud's use of information received from Google APIs adheres to the
+  <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>,
+  including the Limited Use requirements.</p>
+
+  <h2>Removing access and data</h2>
+  <p>Disconnect Google Drive in OmniCloud's Settings, or revoke access at
+  <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>. Deleting a file in
+  OmniCloud deletes it from your Drive and from the local index.</p>
+
+  <h2>Contact</h2>
+  <p><a href="https://github.com/VishweshwarAkula/VishweshwarAkula.github.io/issues">open an issue on GitHub</a></p>
+</body>
+</html>

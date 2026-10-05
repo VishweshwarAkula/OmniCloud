@@ -7,7 +7,7 @@ name: omnicloud-app
 #   web ─► api ─► postgres / redis
 #           │ BullMQ flows
 #           ▼
-#   worker × N  (upload │ embed │ ocr │ finalize)  ◄── autoscaler (queue depth → replicas)
+#   worker × N  (upload │ embed │ faces │ finalize)  ◄── autoscaler (queue depth → replicas)
 #           │
 #           ▼
 #   ml × M (SigLIP 2, faces, places, Gemini) ─► weaviate
@@ -30,7 +30,8 @@ services:
     environment:
       API_UPSTREAM: api:3000
       MAX_BODY_SIZE: ${NGINX_MAX_BODY_SIZE:-512m}
-    ports: ["${WEB_PORT:-8080}:8080"]
+    # 127.0.0.1 only: single-user app with no login, so it must not be reachable from the network.
+    ports: ["127.0.0.1:${WEB_PORT:-8080}:8080"]
     depends_on:
       api: { condition: service_healthy }
     restart: unless-stopped
@@ -50,7 +51,8 @@ services:
     environment:
       <<: *app-env
       DB_POOL_MAX: 15
-    volumes: ["${DATA_DIR:-./.data}/uploads:/data/uploads", "${DATA_DIR:-./.data}/library:/data/library"]
+      OWNER_EMAIL: ${OWNER_EMAIL:-}
+    volumes: ["${DATA_DIR:-./.data}/uploads:/data/uploads"]
     depends_on:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
@@ -63,7 +65,7 @@ services:
     environment:
       <<: *app-env
       DB_POOL_MAX: 5
-    volumes: ["${DATA_DIR:-./.data}/uploads:/data/uploads", "${DATA_DIR:-./.data}/library:/data/library"]
+    volumes: ["${DATA_DIR:-./.data}/uploads:/data/uploads"]
     healthcheck: { disable: true }
     stop_grace_period: 2m # in-flight jobs finish before the container exits
     depends_on:

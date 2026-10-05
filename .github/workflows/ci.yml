@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv venv -p 3.12 && uv pip install fastapi python-multipart pydantic weaviate-client pillow google-genai numpy opencv-python-headless httpx -r requirements-dev.txt
+      - run: uv venv -p 3.12 && uv pip install fastapi python-multipart pydantic weaviate-client pillow pillow-heif google-genai numpy opencv-python-headless httpx pymupdf python-docx -r requirements-dev.txt
       - run: uv run ruff check app tests scripts
       - run: uv run pytest -q
 

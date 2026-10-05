@@ -5,7 +5,7 @@ services:
     build: { context: ./web, target: dev }
     environment:
       VITE_API_PROXY: http://api:3000
-    ports: !override ["5173:5173"]
+    ports: !override ["127.0.0.1:5173:5173"]
     volumes:
       - ./web:/app
       - /app/node_modules
@@ -19,7 +19,7 @@ services:
     build: { context: ./api, target: dev }
     image: omnicloud-app/api:dev
     environment: { NODE_ENV: development }
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:3000:3000"]
     volumes: [./api/src:/app/src, ./api/migrations:/app/migrations]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
@@ -50,10 +50,10 @@ services:
       retries: 10
 
   postgres:
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
 
   redis:
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
 
   weaviate:
-    ports: ["8081:8080"]
+    ports: ["127.0.0.1:8081:8080"]
