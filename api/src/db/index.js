@@ -25,5 +25,5 @@ export async function one(text, params) {
   return (await query(text, params))[0] ?? null;
 }
 
-export const PROVIDER_IDS = { gdrive: 1, dropbox: 2, local: 3 };
-export const PROVIDER_KEYS = { 1: "gdrive", 2: "dropbox", 3: "local" };
+export const PROVIDER_IDS = { gdrive: 1, dropbox: 2, koofr: 4, pcloud: 5 }; // 3 was local disk (removed: files live in the cloud)
+export const PROVIDER_KEYS = { 1: "gdrive", 2: "dropbox", 4: "koofr", 5: "pcloud" };
