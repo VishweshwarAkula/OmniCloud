@@ -6,10 +6,11 @@ import { redis } from "../lib/redis.js";
 import { PROVIDER_IDS, one, query } from "../db/index.js";
 import { dropbox } from "./dropbox.js";
 import { gdrive } from "./gdrive.js";
-import { local } from "./local.js";
+import { koofr } from "./koofr.js";
+import { pcloud } from "./pcloud.js";
 import { UpstreamError } from "./http.js";
 
-export const providers = { gdrive, dropbox, local };
+export const providers = { gdrive, dropbox, koofr, pcloud };
 
 export function getProvider(key) {
   const provider = providers[key];
@@ -45,8 +46,7 @@ export async function deleteRefreshToken(userId, key) {
 export async function connectedProviders(userId) {
   const rows = await query("select provider_id from refresh_tokens where user_id = $1", [userId]);
   const ids = new Set(rows.map((r) => r.provider_id));
-  // Local disk needs no grant: it's "connected" whenever it's enabled.
-  return Object.keys(PROVIDER_IDS).filter((k) => ids.has(PROVIDER_IDS[k]) || (k === "local" && providerConfigured.local));
+  return Object.keys(PROVIDER_IDS).filter((k) => ids.has(PROVIDER_IDS[k]));
 }
 
 export async function invalidateUserCaches(userId, key) {
@@ -60,6 +60,12 @@ const inflight = new Map();
 // Access tokens are cached in Redis until shortly before expiry, and concurrent
 // refreshes for the same user/provider share one upstream call.
 export async function getAccessToken(userId, key) {
+  // Providers with non-expiring credentials (pCloud token, Koofr app password): use them as stored.
+  if (providers[key]?.static) {
+    const stored = await getRefreshToken(userId, key);
+    if (!stored) throw new HttpError(409, `Connect ${providers[key].label} first.`, "provider_not_connected");
+    return stored;
+  }
   const cacheKey = `omni:at:${key}:${userId}`;
   const cached = await redis.get(cacheKey);
   if (cached) return cached;
@@ -87,12 +93,13 @@ export async function getAccessToken(userId, key) {
 
 // Runs fn with a valid access token, retrying once with a fresh token on a 401.
 export async function withAccessToken(userId, key, fn) {
-  if (providers[key]?.local) return fn(null, getProvider(key));
   const at = await getAccessToken(userId, key);
   try {
     return await fn(at, getProvider(key));
   } catch (err) {
     if (!(err instanceof UpstreamError && err.status === 401)) throw err;
+    // A static credential that gets a 401 was revoked on the provider's side: ask to reconnect.
+    if (providers[key]?.static) throw new ProviderAuthError(providers[key].label);
     await redis.del(`omni:at:${key}:${userId}`);
     return fn(await getAccessToken(userId, key), getProvider(key));
   }

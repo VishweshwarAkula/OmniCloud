@@ -54,13 +54,13 @@ export const dropbox = {
     return { total, used, free: Math.max(0, total - used) };
   },
 
-  async upload(at, { name, buffer }) {
+  async upload(at, { name, folder = [], buffer }) {
     const file = await requestJson(`${CONTENT}/files/upload`, {
       method: "POST",
       headers: {
         ...auth(at),
         "Content-Type": "application/octet-stream",
-        "Dropbox-API-Arg": apiArg({ path: `${FOLDER}/${name}`, mode: "add", autorename: true, mute: true }),
+        "Dropbox-API-Arg": apiArg({ path: [FOLDER, ...folder, name].join("/"), mode: "add", autorename: true, mute: true }),
       },
       body: buffer,
       signal: AbortSignal.timeout(120_000),
@@ -95,5 +95,23 @@ export const dropbox = {
     } catch (err) {
       if (!(err instanceof UpstreamError && err.status === 409)) throw err;
     }
+  },
+
+  async removeEmptyFolder(at, _userId, folder) {
+    const path = [FOLDER, ...folder].join("/");
+    let list;
+    try {
+      list = await requestJson(`${API}/files/list_folder`, {
+        method: "POST",
+        headers: { ...auth(at), "Content-Type": "application/json" },
+        body: JSON.stringify({ path, limit: 1 }),
+      });
+    } catch (err) {
+      if (err instanceof UpstreamError && err.status === 409) return false; // not found
+      throw err;
+    }
+    if (list.entries.length) return false;
+    await this.remove(at, path);
+    return true;
   },
 };
