@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { Router } from "express";
 import { config, providerConfigured } from "../config.js";
 import { asyncRoute, HttpError } from "../lib/errors.js";
-import { redis } from "../lib/redis.js";
+import { genKey, redis } from "../lib/redis.js";
 import { requireAuth } from "../middleware/auth.js";
 import {
   connectedProviders,
@@ -40,7 +40,7 @@ router.get(
   requireAuth,
   asyncRoute(async (req, res) => {
     const userId = req.user.id;
-    const cacheKey = `omni:quota:${userId}`;
+    const cacheKey = await genKey(`omni:quota:${userId}`); // see genKey: uploads/deletes invalidate it
     const cached = await redis.get(cacheKey);
     if (cached) return res.json(JSON.parse(cached));
 

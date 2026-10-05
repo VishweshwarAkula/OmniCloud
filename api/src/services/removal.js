@@ -1,9 +1,9 @@
 import fs from "node:fs/promises";
 import { PROVIDER_IDS, PROVIDER_KEYS, query } from "../db/index.js";
 import { logger } from "../lib/logger.js";
-import { redis } from "../lib/redis.js";
+import { bumpGen, redis } from "../lib/redis.js";
 import { providers, withAccessToken } from "../providers/index.js";
-import { queues, releaseFlow } from "../queues/index.js";
+import { flowState, queues, releaseFlow } from "../queues/index.js";
 import { findByHash } from "./files.js";
 import { deleteFromIndex } from "./ml.js";
 import { deleteFileAndRecount } from "./people.js";
@@ -23,11 +23,39 @@ export async function removeFile(row, { fromCloud = false } = {}) {
   if (fromCloud && row.provider_file_id) {
     await withAccessToken(row.user_id, PROVIDER_KEYS[row.provider_id], (at, p) => p.remove(at, row.provider_file_id));
   }
-  await deleteFromIndex({ userId: row.user_id, fileHash: row.file_hash }).catch((err) =>
-    logger.warn({ err: err.message, fileId: row.id }, "index delete failed")
-  );
+  await dropFromIndex(row.user_id, row.file_hash);
   await deleteFileAndRecount(row.id);
-  await redis.del(`omni:searchctx:${row.user_id}`);
+  await bumpGen(`omni:searchctx:${row.user_id}`);
+}
+
+/*
+  Index deletes are retried instead of being dropped on error: a vector/face left behind for a
+  deleted file would still attract new faces to its person and cost search work. Failures go to a
+  Redis set that the worker drains every few minutes (retryIndexDeletes).
+*/
+const INDEX_RETRY = "omni:index-delete-retry";
+
+export async function dropFromIndex(userId, fileHash) {
+  try {
+    await deleteFromIndex({ userId, fileHash });
+  } catch (err) {
+    logger.warn({ err: err.message, fileHash }, "index delete failed; will retry");
+    await redis.sadd(INDEX_RETRY, JSON.stringify({ userId, fileHash }));
+  }
+}
+
+export async function retryIndexDeletes() {
+  for (const entry of await redis.smembers(INDEX_RETRY)) {
+    const { userId, fileHash } = JSON.parse(entry);
+    // The same file uploaded again since: its index entries are the new copy's, keep them.
+    const live = (await findByHash(userId, fileHash)) || !["missing", "completed", "failed"].includes(await flowState(userId, fileHash));
+    try {
+      if (!live) await deleteFromIndex({ userId, fileHash });
+      await redis.srem(INDEX_RETRY, entry);
+    } catch (err) {
+      logger.warn({ err: err.message, fileHash }, "index delete retry failed");
+    }
+  }
 }
 
 // Runs fn over items, `limit` at a time; returns each item's error (or null).
@@ -135,7 +163,7 @@ export const clearCancel = (flowId) => redis.del(cancelKey(flowId));
 export async function cleanupCancelled(d) {
   await fs.unlink(d.tmpPath).catch(() => {});
   await releaseFlow(d.userId, d.fileHash);
-  await deleteFromIndex({ userId: d.userId, fileHash: d.fileHash }).catch(() => {});
+  await dropFromIndex(d.userId, d.fileHash);
   const row = await findByHash(d.userId, d.fileHash);
   if (row) await removeFile(row, { fromCloud: true }); // it was only in the cloud because of this upload
   else if (d.uploaded) await withAccessToken(d.userId, d.provider, (at, p) => p.remove(at, d.uploaded.id));

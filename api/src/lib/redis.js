@@ -62,3 +62,16 @@ export async function withLock(key, fn, { ttlMs = 60_000, waitMs = 120_000 } = {
     await redis.eval(RELEASE, 1, key, token).catch(() => {});
   }
 }
+
+/*
+  Generation-tagged cache keys, for caches that a change must invalidate (access tokens, quotas,
+  search context). Invalidating bumps the generation instead of deleting the entry, and a reader
+  builds its key from the generation it saw *before* loading the data. So a reader that loaded data
+  just before a change can only write it under the old generation, which nobody reads again: a
+  stale value can never be put back after an invalidation (delete-then-stale-set race).
+*/
+export async function genKey(name) {
+  return `${name}:g${(await redis.get(`${name}:gen`)) ?? 0}`;
+}
+
+export const bumpGen = (...names) => Promise.all(names.map((name) => redis.incr(`${name}:gen`)));

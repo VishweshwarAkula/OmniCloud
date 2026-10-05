@@ -8,16 +8,16 @@ import os from "node:os";
 import path from "node:path";
 import { UnrecoverableError, Worker } from "bullmq";
 import { config } from "./config.js";
-import { pool, PROVIDER_KEYS } from "./db/index.js";
+import { pool, PROVIDER_KEYS, query } from "./db/index.js";
 import { HttpError, ProviderAuthError } from "./lib/errors.js";
 import { logger } from "./lib/logger.js";
 import { bloomAdd, createRedis, ensureBloom, redis, withLock } from "./lib/redis.js";
 import { invalidateUserCaches, withAccessToken } from "./providers/index.js";
-import { closeQueues, flowState, Q, releaseFlow, stageState } from "./queues/index.js";
+import { closeQueues, flowState, Q, queues, releaseFlow, stageState } from "./queues/index.js";
 import { findByHash, getFile, metadataPatch, updateFile, upsertFile } from "./services/files.js";
-import { deleteFromIndex, detectFaces, embedImage, indexDocument } from "./services/ml.js";
+import { detectFaces, embedImage, indexDocument } from "./services/ml.js";
 import { facesLock, storeFaces } from "./services/people.js";
-import { cleanupCancelled, isCancelled } from "./services/removal.js";
+import { cleanupCancelled, dropFromIndex, isCancelled, retryIndexDeletes } from "./services/removal.js";
 
 await ensureBloom();
 
@@ -218,7 +218,7 @@ async function onFinalFailure(stage, job) {
   const row = await findByHash(d.userId, d.fileHash).catch(() => null);
   if (stage === "upload") {
     await fs.unlink(d.tmpPath).catch(() => {});
-    await deleteFromIndex({ userId: d.userId, fileHash: d.fileHash }).catch(() => {});
+    await dropFromIndex(d.userId, d.fileHash);
     if (d.uploaded && !row?.provider_file_id) {
       await withAccessToken(d.userId, d.provider, (at, p) => p.remove(at, d.uploaded.id)).catch((err) =>
         logger.warn({ err: err.message, jobId: job.id }, "orphaned cloud copy could not be removed")
@@ -269,16 +269,49 @@ const workers = enabled.map((stage) => {
   return worker;
 });
 
-// Sweep staged files orphaned by crashes (older than a day). Cheap and idempotent per replica.
+/*
+  Maintenance, every 5 minutes, by one replica at a time (a lock that simply expires). It repairs
+  what a crash in the middle of a multi-step operation could leave behind:
+    - staged uploads orphaned by a crash (older than a day AND not needed by any live job)
+    - index deletes that failed and were queued for retry
+    - rows stuck in "indexing" because a worker died inside a failure handler: if their flow is
+      over, the file is in the cloud but unsearchable, so it is shown as ready
+*/
+const LIVE = ["waiting", "prioritized", "active", "delayed", "waiting-children"];
+
 async function sweepUploads() {
   const cutoff = Date.now() - 86_400_000;
+  const needed = new Set();
+  for (const q of Object.values(queues)) {
+    for (const j of await q.getJobs(LIVE)) if (j?.data?.tmpPath) needed.add(path.basename(j.data.tmpPath));
+  }
   for (const name of await fs.readdir(config.UPLOAD_DIR).catch(() => [])) {
+    if (needed.has(name)) continue;
     const p = path.join(config.UPLOAD_DIR, name);
     const stat = await fs.stat(p).catch(() => null);
     if (stat && stat.mtimeMs < cutoff) await fs.unlink(p).catch(() => {});
   }
 }
-const sweepTimer = setInterval(sweepUploads, 3_600_000);
+
+async function settleStuckRows() {
+  const rows = await query(
+    "select id, user_id, file_hash from files where status = 'indexing' and provider_file_id is not null and created_at < now() - interval '30 minutes'"
+  );
+  for (const row of rows) {
+    if (["failed", "missing", "completed"].includes(await flowState(row.user_id, row.file_hash))) {
+      await updateFile(row.id, { status: "ready" });
+      logger.info({ fileId: row.id }, "settled a file left indexing by an interrupted flow");
+    }
+  }
+}
+
+async function maintenance() {
+  if (!(await redis.set("omni:lock:maintenance", os.hostname(), "PX", 4 * 60_000, "NX"))) return;
+  for (const task of [sweepUploads, retryIndexDeletes, settleStuckRows]) {
+    await task().catch((err) => logger.warn({ task: task.name, err: err.message }, "maintenance task failed"));
+  }
+}
+const sweepTimer = setInterval(maintenance, 5 * 60_000);
 
 logger.info({ stages: enabled, host: os.hostname(), concurrency: Object.fromEntries(enabled.map((s) => [s, stageSettings[s].concurrency])) }, "worker ready");
 

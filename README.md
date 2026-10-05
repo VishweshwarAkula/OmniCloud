@@ -117,6 +117,12 @@ The UI shows results immediately, then swaps in the re-ranked order.
 - **Document re-index:** new passages overwrite the old ones first, then leftovers are trimmed.
 - **Koofr:** uploads are create-only (`If-None-Match: *`).
 - **Folder removal:** a cloud folder is removed only if nothing tracked or in flight lives in it. Drive folders go to the trash.
+- **Caches** (access tokens, quotas, search context) are generation-tagged. Invalidating bumps the generation, so a slow reader can never write a stale value back after a reconnect or a rename.
+- **Images** are written to the vector index in one upsert, with no check-then-insert window.
+- **Repair loop:** every 5 minutes, one worker:
+  - retries failed index deletes (never for a file that has been uploaded again since);
+  - removes staged uploads older than a day that no live job still needs;
+  - marks files stuck as "indexing" by an interrupted upload as ready.
 
 ## Configuration
 

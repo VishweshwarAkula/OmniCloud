@@ -107,10 +107,13 @@ class VectorStore:
         oid = self.object_id(user_id, file_hash)
         tenant = self._tenant(user_id, create=True)
         props = {"file_id": file_hash, **{k: v for k, v in props.items() if v is not None}}
-        if tenant.data.exists(oid):
-            tenant.data.replace(uuid=oid, properties=props, vector=vector)
-        else:
-            tenant.data.insert(properties=props, vector=vector, uuid=oid)
+        # One write that inserts or replaces (batch writes upsert by id): no exists-then-insert
+        # window in which a concurrent embed + reindex of the same file could collide.
+        from weaviate.classes.data import DataObject
+
+        res = tenant.data.insert_many([DataObject(uuid=oid, properties=props, vector=vector)])
+        if res.has_errors:
+            raise RuntimeError(f"weaviate upsert failed: {list(res.errors.values())[:1]}")
         return oid
 
     @staticmethod

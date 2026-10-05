@@ -10,6 +10,12 @@ vi.mock("../src/lib/redis.js", () => {
     set: vi.fn(async (k, v) => store.set(k, v)),
     exists: vi.fn(async (k) => (store.has(k) ? 1 : 0)),
     hset: vi.fn(async () => 1),
+    incr: vi.fn(async (k) => {
+      const n = Number(store.get(k) ?? 0) + 1;
+      store.set(k, String(n));
+      return n;
+    }),
+    sadd: vi.fn(async () => 1),
     eval: vi.fn(async () => 1),
     del: vi.fn(async (...ks) => ks.forEach((k) => store.delete(k))),
     expire: vi.fn(async () => 1),
@@ -24,7 +30,17 @@ vi.mock("../src/lib/redis.js", () => {
       return chain;
     },
   };
-  return { redis, createRedis: () => redis, ensureBloom: vi.fn(), bloomMightContain: vi.fn(async () => false), bloomAdd: vi.fn() };
+  return {
+    redis,
+    createRedis: () => redis,
+    ensureBloom: vi.fn(),
+    bloomMightContain: vi.fn(async () => false),
+    bloomAdd: vi.fn(),
+    // The real implementations are exercised in consistency.test.js.
+    genKey: async (name) => name,
+    bumpGen: vi.fn(async () => {}),
+    withLock: async (_key, fn) => fn(),
+  };
 });
 vi.mock("../src/db/index.js", () => ({
   pool: {

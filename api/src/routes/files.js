@@ -10,7 +10,7 @@ import { removeFile, removeFolder } from "../services/removal.js";
 import { capabilities, rerankResults, searchImages, understandQuery } from "../services/ml.js";
 import { namedPeople } from "../services/people.js";
 import { config } from "../config.js";
-import { redis } from "../lib/redis.js";
+import { genKey, redis } from "../lib/redis.js";
 
 const router = Router();
 
@@ -76,7 +76,7 @@ const searchLimiter = rateLimit({
 
 // Grounding for query understanding: the user's named people and known places (cached briefly).
 async function searchContext(userId) {
-  const key = `omni:searchctx:${userId}`;
+  const key = await genKey(`omni:searchctx:${userId}`); // a rename bumps it: no stale context put back
   const cached = await redis.get(key);
   if (cached) return JSON.parse(cached);
   const [people, places] = await Promise.all([namedPeople(userId), knownPlaces(userId)]);

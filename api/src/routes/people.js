@@ -1,14 +1,13 @@
 import { Router } from "express";
 import { asyncRoute, HttpError } from "../lib/errors.js";
-import { redis } from "../lib/redis.js";
 import { requireAuth } from "../middleware/auth.js";
 import { mergeFaces } from "../services/ml.js";
 import { assertOwnPeople, facesLock, listPeople, mergePeople, updatePerson } from "../services/people.js";
-import { withLock } from "../lib/redis.js";
+import { bumpGen, withLock } from "../lib/redis.js";
 
 const router = Router();
 const uuid = (v) => typeof v === "string" && /^[0-9a-f-]{36}$/i.test(v);
-const forgetSearchContext = (userId) => redis.del(`omni:searchctx:${userId}`);
+const forgetSearchContext = (userId) => bumpGen(`omni:searchctx:${userId}`);
 
 router.get(
   "/people",

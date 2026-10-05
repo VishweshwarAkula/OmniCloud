@@ -2,7 +2,7 @@ import { providerConfigured } from "../config.js";
 import { decrypt, encrypt } from "../lib/crypto.js";
 import { HttpError, ProviderAuthError } from "../lib/errors.js";
 import { logger } from "../lib/logger.js";
-import { redis } from "../lib/redis.js";
+import { bumpGen, genKey, redis } from "../lib/redis.js";
 import { PROVIDER_IDS, one, query } from "../db/index.js";
 import { dropbox } from "./dropbox.js";
 import { gdrive } from "./gdrive.js";
@@ -50,7 +50,7 @@ export async function connectedProviders(userId) {
 }
 
 export async function invalidateUserCaches(userId, key) {
-  await redis.del(`omni:at:${key}:${userId}`, `omni:quota:${userId}`);
+  await bumpGen(`omni:at:${key}:${userId}`, `omni:quota:${userId}`);
 }
 
 /* ------------------------------ access tokens ----------------------------- */
@@ -66,7 +66,8 @@ export async function getAccessToken(userId, key) {
     if (!stored) throw new HttpError(409, `Connect ${providers[key].label} first.`, "provider_not_connected");
     return stored;
   }
-  const cacheKey = `omni:at:${key}:${userId}`;
+  // Generation-tagged: a refresh that started before a reconnect can't cache the old account's token.
+  const cacheKey = await genKey(`omni:at:${key}:${userId}`);
   const cached = await redis.get(cacheKey);
   if (cached) return cached;
 
@@ -100,7 +101,7 @@ export async function withAccessToken(userId, key, fn) {
     if (!(err instanceof UpstreamError && err.status === 401)) throw err;
     // A static credential that gets a 401 was revoked on the provider's side: ask to reconnect.
     if (providers[key]?.static) throw new ProviderAuthError(providers[key].label);
-    await redis.del(`omni:at:${key}:${userId}`);
+    await bumpGen(`omni:at:${key}:${userId}`);
     return fn(await getAccessToken(userId, key), getProvider(key));
   }
 }
