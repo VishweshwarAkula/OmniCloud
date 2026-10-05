@@ -50,6 +50,10 @@ class _Scores(BaseModel):
 
 
 def gemini_rerank(client, model_name: str, query: str, images: list[tuple[str, bytes]]) -> dict[str, float]:
+    from . import gemini as g
+
+    if not g.available():
+        raise RuntimeError("gemini paused after a rate limit")
     from google.genai import types
 
     parts = [

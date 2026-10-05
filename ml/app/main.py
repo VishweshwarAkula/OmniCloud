@@ -2,8 +2,7 @@
 
   /embed       SigLIP 2 vector + zero-shot tags + EXIF metadata + place names → Weaviate
   /faces       local face detection/recognition + incremental clustering into people
-  /ocr         Gemini receipt reading
-  /understand  query → structured filters        (Gemini, local rules fallback)
+  /understand  query → structured filters        (rules + local Qwen3-0.6B; Gemini optional)
   /search      hybrid vector + BM25, optional allow-list
   /rerank      second-stage ordering             (Gemini vision, local SigLIP/MMR fallback)
 
@@ -13,6 +12,7 @@ Stateless with respect to the app database — the API workers own all Postgres 
 import asyncio
 import hmac
 import logging
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date
@@ -21,39 +21,39 @@ from typing import Any
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from . import documents as docs
 from . import metadata as md
 from .config import Settings
-from .ocr import Receipt
-from .ranking import fuse
+from .ranking import fuse, fuse_docs, match_from_api_score
 from .rerank import decode_images, gemini_rerank, local_rerank
 from .understand import Understanding
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ml")
 
-MAX_IMAGE_BYTES = 40 * 1024 * 1024
+MAX_IMAGE_BYTES = 60 * 1024 * 1024  # images and documents (documents up to 50 MB)
 
 
 @dataclass
 class Services:
     model: Any
     store: Any
-    reader: Any
     geocoder: Any = None
     faces: Any = None
     face_store: Any = None
     understander: Any = None
     gemini: Any = None
     rerank_mode: str = "local"
+    text_embedder: Any = None
+    doc_store: Any = None
 
 
 def build_services(settings: Settings) -> Services:
     from . import gemini
     from .embeddings import VisionModel
-    from .ocr import ReceiptReader
     from .places import Geocoder
     from .understand import Understander
-    from .vectorstore import FaceStore, VectorStore, collection_for
+    from .vectorstore import DocStore, FaceStore, VectorStore, collection_for, doc_collection_for
 
     g = gemini.client(settings.google_api_key)
     log.info("loading %s/%s", settings.clip_model, settings.clip_pretrained)
@@ -71,14 +71,28 @@ def build_services(settings: Settings) -> Services:
         except Exception as exc:
             log.warning("face engine unavailable: %s", exc)
 
+    llm = None
+    if settings.understand_mode in ("llm", "auto"):
+        try:
+            from .llm import LocalLLM
+
+            llm = LocalLLM(f"{settings.data_dir}/llm/{settings.llm_model}")
+            log.info("local LLM loaded: %s", llm.name)
+        except Exception as exc:
+            log.warning("local LLM unavailable (%s); query understanding uses rules", exc)
+
+    log.info("loading text embedder %s", settings.text_model)
+    text_embedder = docs.TextEmbedder(settings.text_model, settings.torch_threads)
+
     s = Services(
         model=model,
         store=store,
-        reader=ReceiptReader(g, settings.gemini_model),
+        text_embedder=text_embedder,
+        doc_store=DocStore(store.client, doc_collection_for(settings.text_model)),
         geocoder=Geocoder(settings.geocoder_mode, f"{settings.data_dir}/geonames", settings.nominatim_url),
         faces=faces,
         face_store=face_store,
-        understander=Understander(settings.understand_mode, g, settings.gemini_model),
+        understander=Understander(settings.understand_mode, g, settings.understand_model, llm),
         gemini=g,
         rerank_mode="api" if (g and settings.rerank_mode in ("auto", "api")) else "local",
     )
@@ -92,7 +106,7 @@ def capabilities(s: Services) -> dict:
         "faces": "local" if s.faces else None,
         "understand": getattr(s.understander, "mode", None) if s.understander else None,
         "rerank": s.rerank_mode,
-        "ocr": "api" if getattr(s.reader, "client", None) else None,
+        "documents": "local" if s.doc_store else None,
     }
 
 
@@ -106,12 +120,31 @@ class SearchReq(BaseModel):
 
 class SearchHit(BaseModel):
     file_hash: str
-    score: float
+    score: float  # ranking only — relative to the best result of this query
     prob: float
+    margin: float
+    match: str  # strong | good | possible | metadata
+
+
+class DocResult(BaseModel):
+    file_hash: str
+    page: int | None
+    snippet: str
+    score: float
+    cos: float
+    match: str  # strong | good | possible | keyword
 
 
 class SearchResp(BaseModel):
     results: list[SearchHit]
+    doc_results: list[DocResult] = []
+
+
+class DocIndexResp(BaseModel):
+    title: str
+    page_count: int
+    chunks: int
+    excerpt: str
 
 
 class Tag(BaseModel):
@@ -174,6 +207,7 @@ class UnderstandReq(BaseModel):
 class RerankCandidate(BaseModel):
     file_hash: str
     score: float
+    match: str | None = None  # set when an API judged relevance itself
 
 
 class RerankReq(BaseModel):
@@ -225,7 +259,6 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
             "model": s.model.name,
             "dim": s.model.dim,
             "capabilities": capabilities(s),
-            "ocr": bool(getattr(s.reader, "client", None)),
         }
 
     def _index(s: Services, raw: bytes, user_id: str, file_hash: str, filename: str) -> EmbedResp:
@@ -298,11 +331,6 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         )
         return {"updated": n}
 
-    @app.post("/ocr", response_model=Receipt, dependencies=[Depends(require_token)])
-    async def ocr(image: UploadFile = File(...), s: Services = Depends(svc)):
-        raw = await read_image(image)
-        return await asyncio.to_thread(s.reader.read, raw, image.content_type or "image/jpeg")
-
     @app.post("/understand", response_model=Understanding, dependencies=[Depends(require_token)])
     async def understand(req: UnderstandReq, s: Services = Depends(svc)):
         return await asyncio.to_thread(
@@ -328,24 +356,91 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
             h: (cos, cos - sum(a * b for a, b in zip(base, vec, strict=False))) for h, (cos, vec) in vec_hits.items()
         }
         ranked = fuse(scored, kw_hits, s.model.prob, k, settings.search_alpha, settings.search_min_margin)
-        return SearchResp(results=[SearchHit(file_hash=h, score=sc, prob=p) for h, sc, p in ranked])
+        doc_hits = await asyncio.to_thread(_search_docs, s, req, visual, keywords, k) if s.doc_store else []
+        return SearchResp(results=[SearchHit(**hit._asdict()) for hit in ranked], doc_results=doc_hits)
+
+    def _search_docs(s: Services, req: SearchReq, visual: str, keywords: str, k: int) -> list[DocResult]:
+        qvec = s.text_embedder.query(visual) if visual else None
+        vec = s.doc_store.vector_hits(req.user_id, qvec, max(k * 4, 40), req.allow) if qvec else []
+        kw = s.doc_store.keyword_hits(req.user_id, keywords, max(k * 4, 40), req.allow) if keywords else []
+        hits = fuse_docs(vec, kw, k, min_cos=settings.doc_min_cos, query=keywords or visual)
+        return [
+            DocResult(
+                file_hash=h.file_hash,
+                page=h.page,
+                snippet=docs.snippet(h.text, visual or keywords),
+                score=h.score,
+                cos=h.cos,
+                match=h.match,
+            )
+            for h in hits
+        ]
+
+    # A long document (900+ pages) can outlast the caller's timeout; its retry must join the run
+    # already in progress instead of starting a second full embedding behind it.
+    doc_inflight: dict[tuple[str, str], asyncio.Future] = {}
+
+    def _index_document(s: Services, raw: bytes, user_id: str, file_hash: str, filename: str) -> DocIndexResp:
+        try:
+            title, pages = docs.extract(raw, filename)
+        except ValueError as exc:
+            raise HTTPException(415, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(422, f"could not read document: {exc}") from exc
+        chunks = docs.chunk(pages)
+        if not chunks:  # e.g. a scanned PDF with no text layer: still findable by its title
+            chunks = [docs.Chunk(page=1 if pages and pages[0][0] else None, index=0, text=title)]
+        vectors = s.text_embedder.passages([f"{title}. {c.text}" for c in chunks])
+        n = s.doc_store.replace_document(user_id, file_hash, title, chunks, vectors)
+        # Plain-text excerpt for the library card (no markdown markers).
+        excerpt = re.sub(r"[#*_`>]+", "", next((t for _, t in pages if t), ""))
+        excerpt = re.sub(r"\s+", " ", excerpt).strip()[:400]
+        page_count = sum(1 for p, _ in pages if p is not None) or (1 if pages else 0)
+        return DocIndexResp(title=title, page_count=page_count, chunks=n, excerpt=excerpt)
+
+    @app.post("/documents/index", response_model=DocIndexResp, dependencies=[Depends(require_token)])
+    async def index_document(
+        file: UploadFile = File(...),
+        user_id: str = Form(..., min_length=1, max_length=128),
+        file_hash: str = Form(..., pattern=r"^[0-9a-f]{64}$"),
+        filename: str = Form(default="", max_length=512),
+        s: Services = Depends(svc),
+    ):
+        raw = await read_image(file)  # same size/emptiness checks
+        if not s.doc_store:
+            raise HTTPException(503, "documents disabled")
+        key = (user_id, file_hash)
+        task = doc_inflight.get(key)
+        if task is None:
+            task = asyncio.ensure_future(
+                asyncio.to_thread(_index_document, s, raw, user_id, file_hash, filename or file.filename or "")
+            )
+            doc_inflight[key] = task
+            task.add_done_callback(lambda _t: doc_inflight.pop(key, None))
+        return await asyncio.shield(task)  # a disconnected caller must not cancel the shared run
 
     def _rerank(s: Services, req: RerankReq) -> RerankResp:
         cands = [(c.file_hash, c.score) for c in req.candidates]
         images = decode_images(req.images)
         if s.rerank_mode == "api" and s.gemini and images:
             try:
-                scores = gemini_rerank(s.gemini, settings.gemini_model, req.query, images)
+                scores = gemini_rerank(s.gemini, settings.rerank_model, req.query, images)
                 first = dict(cands)
                 ordered = sorted(scores, key=lambda h: (-scores[h], -first.get(h, 0)))
                 rest = [(h, sc) for h, sc in cands if h not in scores]
                 return RerankResp(
-                    results=[RerankCandidate(file_hash=h, score=scores[h]) for h in ordered]
+                    results=[
+                        RerankCandidate(file_hash=h, score=scores[h], match=match_from_api_score(scores[h]))
+                        for h in ordered
+                    ]
                     + [RerankCandidate(file_hash=h, score=sc) for h, sc in rest],
                     source="gemini",
                 )
             except Exception as exc:
-                log.warning("gemini rerank failed (%s); using local rerank", exc)
+                from . import gemini as g
+
+                g.note_failure(exc)
+                log.warning("gemini rerank failed (%s); using local rerank", str(exc)[:200])
         vectors = s.store.vectors(req.user_id, [h for h, _ in cands])
         ranked = local_rerank(s.model, vectors, req.query, cands)
         return RerankResp(results=[RerankCandidate(file_hash=h, score=sc) for h, sc in ranked], source="local")
@@ -359,6 +454,8 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
         await asyncio.to_thread(s.store.delete, user_id, file_hash)
         if s.face_store:
             await asyncio.to_thread(s.face_store.delete_file, user_id, file_hash)
+        if s.doc_store:
+            await asyncio.to_thread(s.doc_store.delete_file, user_id, file_hash)
         return {"ok": True}
 
     return app

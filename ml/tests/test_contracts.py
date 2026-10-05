@@ -2,8 +2,8 @@
 
 import inspect
 
-from app.vectorstore import FaceStore, VectorStore
-from tests.test_api import FakeFaceStore, FakeStore
+from app.vectorstore import DocStore, FaceStore, VectorStore
+from tests.test_api import FakeDocStore, FakeFaceStore, FakeStore
 
 
 def params(fn):
@@ -20,3 +20,8 @@ def test_fake_store_matches_vector_store():
 def test_fake_face_store_matches_face_store():
     for name in ("assign", "merge", "delete_file"):
         assert len(params(getattr(FakeFaceStore, name))) == len(params(getattr(FaceStore, name))), name
+
+
+def test_fake_doc_store_matches_doc_store():
+    for name in ("replace_document", "vector_hits", "keyword_hits", "delete_file"):
+        assert len(params(getattr(FakeDocStore, name))) == len(params(getattr(DocStore, name))), name

@@ -1,5 +1,6 @@
 """Download everything the ML service needs at image build time, so containers start offline:
-vision model weights + tokenizer, GeoNames (offline reverse geocoding) and the face models."""
+vision model weights + tokenizer, the query-understanding LLM, GeoNames (offline reverse geocoding)
+and the face models."""
 
 import io
 import os
@@ -23,6 +24,19 @@ open_clip.create_model_and_transforms(name, pretrained=os.getenv("EMBED_MODEL_PR
 open_clip.get_tokenizer(name)
 print("vision model cached:", name)
 
+text_model = os.getenv("TEXT_EMBED_MODEL", "intfloat/multilingual-e5-small")
+from sentence_transformers import SentenceTransformer  # noqa: E402
+
+SentenceTransformer(text_model, device="cpu")
+print("text model cached:", text_model)
+
+# Query understanding: a 4-bit Qwen3-0.6B for llama.cpp (~400 MB).
+from huggingface_hub import hf_hub_download  # noqa: E402
+
+llm_file = os.getenv("LLM_MODEL", "Qwen3-0.6B-Q4_K_M.gguf")
+hf_hub_download(os.getenv("LLM_REPO", "unsloth/Qwen3-0.6B-GGUF"), llm_file, local_dir=DATA / "llm")
+print("llm cached:", llm_file)
+
 geo = DATA / "geonames"
 geo.mkdir(parents=True, exist_ok=True)
 base = "https://download.geonames.org/export/dump"
@@ -44,3 +58,27 @@ for path in (
         raise SystemExit(f"{path}: got {len(data)} bytes (LFS pointer?)")
     (faces / path.split("/")[1]).write_bytes(data)
 print("face models cached")
+
+# Store the big weight files as float16: half the image size. Models still load and run in float32
+# (weights are cast on load); measured embedding change: cosine >= 0.999999, margins move by ~4e-5.
+import glob  # noqa: E402
+
+import torch  # noqa: E402
+from safetensors.torch import load_file, safe_open, save_file  # noqa: E402
+
+for path in glob.glob(str(DATA / "hub/**/*.safetensors"), recursive=True):
+    real = os.path.realpath(path)
+    if os.path.getsize(real) < 50_000_000:
+        continue
+    with safe_open(real, "pt") as f:
+        meta = f.metadata()
+    weights = {k: v.half() if v.dtype == torch.float32 else v for k, v in load_file(real).items()}
+    save_file(weights, real + ".tmp", metadata=meta)
+    os.replace(real + ".tmp", real)
+    print("stored as float16:", path.split("models--")[1].split("/")[0], os.path.getsize(real) // 1_000_000, "MB")
+
+# Download bookkeeping isn't needed at runtime.
+import shutil  # noqa: E402
+
+for junk in (DATA / "xet", DATA / "llm/.cache"):
+    shutil.rmtree(junk, ignore_errors=True)

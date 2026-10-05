@@ -71,3 +71,69 @@ def test_bare_month_means_any_year():
     assert parse("pixel photos from december").months == [12]
     assert parse("in may").months == [5] and parse("in may").date_from is None
     assert parse("december 2024").date_from == "2024-12-01"
+
+
+def test_strip_names_from_visual_query():
+    from app.understand import _strip_names
+
+    assert _strip_names("Leo playing football", ["Leo", "Mumbai"]) == "playing football"
+    assert _strip_names("Lena's hat in Goa", ["Lena", "Goa"]) == "hat"
+    assert _strip_names("Leo", ["Leo"]) is None
+    assert _strip_names("photos", []) is None
+    assert _strip_names("pictures of sunsets", []) == "sunsets"
+
+
+def test_document_words_are_a_kind_filter():
+    u = parse("pdfs about databases")
+    assert u.kinds == ["document"] and u.visual_query == "about databases"
+
+
+# ---------------------------------------------------------------- rules + local LLM
+class FakeLLM:
+    def __init__(self, out=None, fail=False):
+        self.out, self.fail, self.calls = out or {}, fail, 0
+
+    def extract(self, query, people, places):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("model crashed")
+        return {"visual_query": None, "people": [], "places": [], "kinds": [], **self.out}
+
+
+def understand_with(llm, q):
+    from app.understand import Understander
+
+    return Understander("llm", None, "", llm).parse(q, TODAY, PEOPLE, PLACES)
+
+
+def test_llm_fixes_typos_and_translates_while_rules_keep_dates():
+    llm = FakeLLM({"visual_query": "dogs on the beach in goa last summer", "people": ["Rahul"], "places": ["Goa"]})
+    u = understand_with(llm, "perros de rahl en la playa de goa last summer")
+    assert u.source == "llm"
+    assert u.people == ["Rahul"] and u.places == ["Goa"]
+    assert (u.date_from, u.date_to) == ("2026-06-01", "2026-08-31")  # from the rules, never the model
+    assert u.visual_query == "dogs on the beach"
+
+
+def test_llm_cannot_invent_people_or_kinds():
+    # "Priya Sharma" is known but not in the query; "selfie" is not a kind.
+    u = understand_with(
+        FakeLLM({"visual_query": "temple", "people": ["Priya Sharma", "Mom"], "kinds": ["selfie"]}), "mom at the temple"
+    )
+    assert u.people == [] and u.kinds == []
+    assert u.visual_query == "temple"
+
+
+def test_kind_words_and_generic_nouns_leave_the_visual_part():
+    u = understand_with(
+        FakeLLM({"visual_query": "receipts photos from december", "kinds": ["receipt"]}), "receipts from december"
+    )
+    assert u.kinds == ["receipt"] and u.months == [12]
+    assert u.visual_query is None
+
+
+def test_single_words_and_failures_use_rules_only():
+    llm = FakeLLM({"visual_query": "nonsense"})
+    assert understand_with(llm, "sunset").source == "local" and llm.calls == 0
+    u = understand_with(FakeLLM(fail=True), "rahul at the beach")
+    assert u.source == "local" and u.people == ["Rahul"] and u.visual_query == "beach"

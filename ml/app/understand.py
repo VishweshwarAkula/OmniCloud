@@ -3,11 +3,14 @@
   "rahul at the beach in goa last summer"
     → people=[rahul], places=[goa], date 2025-06-01..2025-08-31, visual_query="at the beach"
 
-API path: Gemini with a JSON schema (handles paraphrase, typos, other languages).
-Local path: deterministic rules + the user's known people and places. Any API error → local.
+Default ("llm"): rules + a very small local LLM, nothing leaves the machine. Rules resolve dates
+(small models can't do date math); the LLM reads typos, paraphrase and other languages, and its
+people/places are kept only if they are known AND resemble a word in the query.
+"rules": deterministic rules only. "api": Gemini with a JSON schema. Any failure → rules.
 """
 
 import calendar
+import difflib
 import logging
 import re
 from datetime import date, timedelta
@@ -52,6 +55,10 @@ KIND_WORDS = {
     "documents": "document",
     "scan": "document",
     "scans": "document",
+    "pdf": "document",
+    "pdfs": "document",
+    "doc": "document",
+    "docs": "document",
     "illustration": "illustration",
     "illustrations": "illustration",
     "drawing": "illustration",
@@ -189,28 +196,100 @@ Today is {today}. Known people: {people}. Known places: {places}.
 Rules:
 - Only use people and places from the known lists (match spelling/nicknames to them); leave others in visual_query.
 - Resolve relative dates ("last summer", "two years ago", "christmas 2023") to an inclusive date range.
+  "last <season>" = the most recent one that has fully ended (in October, "last summer" is this year's).
 - A holiday WITHOUT a year ("christmas", "halloween") means every year: no dates, keep it in visual_query.
 - A month WITHOUT a year ("photos from december") means that month in every year: set months, not dates.
 - kinds only if the user clearly asks for that type of image: {kinds}.
-- visual_query: what should be visible in the image, in plain English, without the filters.
+- visual_query: what should be visible in the image, in plain English, without the filters and WITHOUT any
+  person or place names (the image model can't recognise names; "Leo playing football" → "playing football").
   Null if nothing visual remains.
 Query: {query}"""
 
 
+# Queries this short rarely need a model ("sunset", "receipts"): rules alone are exact and instant.
+MIN_WORDS_FOR_API = 3
+MIN_WORDS_FOR_LLM = 2
+
+
+def _mentioned(name: str, query: str) -> bool:
+    """The model may only return a known name that (nearly) appears in the query: no invented people."""
+    words = re.findall(r"\w+", query.lower())
+    return all(
+        any(w == part or difflib.SequenceMatcher(None, w, part).ratio() >= 0.75 for w in words)
+        for part in re.findall(r"\w+", name.lower())
+    )
+
+
+def _strip_dates(text: str, today: date) -> str:
+    """Remove date expressions (rules already turned them into filters) from the model's visual part."""
+    q = f" {text.lower()} "
+
+    def take(pattern: str):
+        nonlocal q
+        m = re.search(PREP + pattern, q)
+        if m:
+            q = q[: m.start()] + " " + q[m.end() :]
+        return m
+
+    while LocalParser._dates(take, today):
+        pass
+    return q
+
+
 class Understander:
-    def __init__(self, mode: str, gemini, model: str):
+    def __init__(self, mode: str, gemini, model: str, llm=None):
         self.local = LocalParser()
-        self.gemini = gemini if mode in ("auto", "api") else None
+        self.gemini = gemini if mode == "api" else None
+        self.llm = llm if mode in ("llm", "auto") else None
         self.model = model
-        self.mode = "api" if self.gemini else "local"
+        self.mode = "api" if self.gemini else "llm" if self.llm else "local"
 
     def parse(self, query: str, today: date, people: list[str], places: list[str]) -> Understanding:
-        if self.gemini:
+        from . import gemini as g
+
+        if self.gemini and len(query.split()) >= MIN_WORDS_FOR_API and g.available():
             try:
                 return self._gemini(query, today, people, places)
             except Exception as exc:
-                log.warning("gemini query understanding failed (%s); using local parser", exc)
-        return self.local.parse(query, today, people, places)
+                g.note_failure(exc)
+                log.warning("gemini query understanding failed (%s); using local parser", str(exc)[:200])
+        rules = self.local.parse(query, today, people, places)
+        if self.llm and len(query.split()) >= MIN_WORDS_FOR_LLM:
+            try:
+                return self._with_llm(rules, query, today, people, places)
+            except Exception as exc:
+                log.warning("local LLM query understanding failed (%s); using rules", str(exc)[:200])
+        return rules
+
+    def _with_llm(self, rules: Understanding, query, today, people, places) -> Understanding:
+        out = self.llm.extract(query, people, places)
+        known_people = {p.lower(): p for p in people}
+        known_places = {p.lower(): p for p in places}
+        found_people = [
+            known_people[p.lower()] for p in out["people"] if p.lower() in known_people and _mentioned(p, query)
+        ]
+        found_places = [
+            known_places[p.lower()] for p in out["places"] if p.lower() in known_places and _mentioned(p, query)
+        ]
+        kinds = list(dict.fromkeys([*rules.kinds, *(k for k in out["kinds"] if k in KINDS)]))
+        visual = out["visual_query"]
+        if visual:
+            visual = _strip_dates(visual, today)
+            # Kind words the filter already covers ("receipts" with kinds=[receipt]) aren't visual.
+            for word, kind in KIND_WORDS.items():
+                if kind in kinds:
+                    visual = re.sub(rf"\b{re.escape(word)}\b", " ", visual, flags=re.I)
+            visual = _strip_names(visual, [*people, *places])
+        return Understanding(
+            visual_query=visual,
+            date_from=rules.date_from,
+            date_to=rules.date_to,
+            months=rules.months,
+            people=list(dict.fromkeys([*rules.people, *found_people])),
+            places=list(dict.fromkeys([*rules.places, *found_places])),
+            kinds=kinds,
+            source="llm",
+        )
 
     def _gemini(self, query, today, people, places) -> Understanding:
         from google.genai import types
@@ -237,14 +316,14 @@ class Understander:
                 temperature=0,
                 response_mime_type="application/json",
                 response_schema=Schema,
-                http_options=types.HttpOptions(timeout=8000),
+                http_options=types.HttpOptions(timeout=10_000),  # Gemini rejects deadlines under 10 s
             ),
         )
         s = resp.parsed if isinstance(resp.parsed, Schema) else Schema.model_validate_json(resp.text or "{}")
         known_people = {p.lower(): p for p in people}
         known_places = {p.lower(): p for p in places}
         return Understanding(
-            visual_query=(s.visual_query or "").strip() or None,
+            visual_query=_strip_names(s.visual_query, [*people, *places]),
             date_from=_iso(s.date_from),
             date_to=_iso(s.date_to),
             # never trust names the model invented: keep only known ones
@@ -254,6 +333,19 @@ class Understander:
             months=[m for m in s.months if 1 <= m <= 12],
             source="gemini",
         )
+
+
+def _strip_names(text: str | None, names: list[str]) -> str | None:
+    """Drop known people/place names and generic nouns the model left in the visual part."""
+    if not text:
+        return None
+    for name in sorted(names, key=len, reverse=True):
+        text = re.sub(rf"\b{re.escape(name)}(?:'s)?\b", " ", text, flags=re.I)
+    # Generic nouns ("photos", "pictures") carry no visual meaning; alone they'd match nothing.
+    text = re.sub(GENERIC, " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" ,.-")
+    text = re.sub(r"^(?:in|at|of|with|and|from)\s+|\s+(?:in|at|of|with|and|from)$", "", text, flags=re.I).strip()
+    return text or None
 
 
 def _iso(v):

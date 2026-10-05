@@ -274,3 +274,104 @@ class FaceStore:
             self._t(user_id).data.delete_many(where=Filter.by_property("file_id").equal(file_hash))
         except Exception as exc:
             log.debug("face delete failed: %s", exc)
+
+
+def doc_collection_for(model_name: str) -> str:
+    return "Doc_" + re.sub(r"[^A-Za-z0-9]+", "_", model_name).strip("_")
+
+
+class DocStore:
+    """Document chunks (one object per chunk), one tenant per user, hybrid vector + BM25 search."""
+
+    def __init__(self, client, name: str):
+        if not client.collections.exists(name):
+            client.collections.create(
+                name=name,
+                vectorizer_config=Configure.Vectorizer.none(),
+                vector_index_config=Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE),
+                multi_tenancy_config=Configure.multi_tenancy(enabled=True, auto_tenant_creation=True),
+                properties=[
+                    Property(
+                        name="file_id",
+                        data_type=DataType.TEXT,
+                        index_filterable=True,
+                        index_searchable=False,
+                        tokenization=Tokenization.FIELD,
+                    ),
+                    Property(name="page", data_type=DataType.INT),
+                    Property(name="chunk", data_type=DataType.INT),
+                    Property(name="title", data_type=DataType.TEXT, tokenization=Tokenization.WORD),
+                    Property(name="text", data_type=DataType.TEXT, tokenization=Tokenization.WORD),
+                ],
+            )
+            log.info("created collection %s", name)
+        self.collection = client.collections.get(name)
+
+    def _t(self, user_id: str):
+        return self.collection.with_tenant(user_id)
+
+    def replace_document(self, user_id: str, file_hash: str, title: str, chunks, vectors) -> int:
+        """Idempotent and never leaves the document half-indexed: chunk ids are deterministic, so the
+        new chunks overwrite the old ones in place first, and only then are leftover chunks (an
+        older, longer version) deleted. If the insert fails, the previous index stays intact."""
+        from weaviate.classes.data import DataObject
+
+        t = self._t(user_id)
+        objs = [
+            DataObject(
+                uuid=str(generate_uuid5(f"{user_id}:{file_hash}:{c.index}")),
+                properties={
+                    "file_id": file_hash,
+                    "page": c.page or 0,
+                    "chunk": c.index,
+                    "title": title,
+                    "text": c.text,
+                },
+                vector=v,
+            )
+            for c, v in zip(chunks, vectors, strict=True)
+        ]
+        for start in range(0, len(objs), 200):
+            res = t.data.insert_many(objs[start : start + 200])
+            if res.has_errors:
+                raise RuntimeError(f"weaviate insert failed: {list(res.errors.values())[:1]}")
+        t.data.delete_many(
+            where=Filter.by_property("file_id").equal(file_hash)
+            & Filter.by_property("chunk").greater_or_equal(len(objs))
+        )
+        return len(objs)
+
+    def vector_hits(self, user_id: str, vector: list[float], limit: int, allow=None) -> list[dict]:
+        try:
+            res = self._t(user_id).query.near_vector(
+                vector,
+                limit=limit,
+                filters=VectorStore._allow(allow),
+                return_properties=["file_id", "page", "text"],
+                return_metadata=MetadataQuery(distance=True),
+            )
+        except Exception as exc:
+            log.debug("doc vector search failed: %s", exc)
+            return []
+        return [{**o.properties, "cos": 1.0 - (o.metadata.distance or 1.0)} for o in res.objects or []]
+
+    def keyword_hits(self, user_id: str, query: str, limit: int, allow=None) -> list[dict]:
+        try:
+            res = self._t(user_id).query.bm25(
+                query,
+                query_properties=["title^2", "text"],
+                limit=limit,
+                filters=VectorStore._allow(allow),
+                return_properties=["file_id", "page", "text"],
+                return_metadata=MetadataQuery(score=True),
+            )
+        except Exception as exc:
+            log.debug("doc keyword search failed: %s", exc)
+            return []
+        return [{**o.properties, "bm25": float(o.metadata.score or 0)} for o in res.objects or []]
+
+    def delete_file(self, user_id: str, file_hash: str) -> None:
+        try:
+            self._t(user_id).data.delete_many(where=Filter.by_property("file_id").equal(file_hash))
+        except Exception as exc:
+            log.debug("doc delete failed: %s", exc)

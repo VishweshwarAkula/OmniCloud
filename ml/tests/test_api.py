@@ -8,7 +8,6 @@ from PIL import Image
 from app.config import Settings
 from app.embeddings import VisionModel
 from app.main import Services, create_app
-from app.ocr import Receipt
 from app.understand import Understander
 
 
@@ -71,6 +70,37 @@ class FakeStore:
         pass
 
 
+class FakeTextEmbedder:
+    def passages(self, texts):
+        return [[1.0, 0.0] for _ in texts]
+
+    def query(self, text):
+        return [1.0, 0.0]
+
+
+class FakeDocStore:
+    def __init__(self):
+        self.docs = {}
+
+    def replace_document(self, user, h, title, chunks, vectors):
+        self.docs[(user, h)] = [(c.page, c.text) for c in chunks]
+        return len(chunks)
+
+    def vector_hits(self, user, vector, limit, allow=None):
+        return [
+            {"file_id": h, "page": p, "text": t, "cos": 0.9}
+            for (u, h), chunks in self.docs.items()
+            if u == user
+            for p, t in chunks
+        ]
+
+    def keyword_hits(self, user, query, limit, allow=None):
+        return []
+
+    def delete_file(self, user, h):
+        self.docs.pop((user, h), None)
+
+
 class FakeFaces:
     name = "fake-faces"
 
@@ -93,23 +123,17 @@ class FakeFaceStore:
         pass
 
 
-class FakeReader:
-    client = None
-
-    def read(self, data, mime):
-        return Receipt(is_receipt=True, total=99.5, currency="INR", vendor="Cafe", confidence=0.9)
-
-
 @pytest.fixture
 def ctx():
     store = FakeStore()
     services = Services(
         model=FakeModel(),
         store=store,
-        reader=FakeReader(),
         faces=FakeFaces(),
         face_store=FakeFaceStore(),
         understander=Understander("local", None, ""),
+        text_embedder=FakeTextEmbedder(),
+        doc_store=FakeDocStore(),
     )
     with TestClient(create_app(Settings(service_token="s3cret"), services)) as c:
         yield c, store
@@ -147,16 +171,10 @@ def test_hybrid_search_and_delete(ctx):
     files = {"image": ("beach-trip.jpg", jpeg(), "image/jpeg")}
     client.post("/embed", headers=H, files=files, data={"user_id": "u1", "file_hash": HASH})
     hits = client.post("/search", headers=H, json={"user_id": "u1", "query": "beach"}).json()["results"]
-    assert hits[0]["file_hash"] == HASH and hits[0]["score"] == 1.0
+    assert hits[0]["file_hash"] == HASH and hits[0]["match"] == "strong"
     assert client.post("/search", headers=H, json={"user_id": "u2", "query": "beach"}).json()["results"] == []
     assert client.delete(f"/index/u1/{HASH}", headers=H).status_code == 200
     assert client.post("/search", headers=H, json={"user_id": "u1", "query": "beach"}).json()["results"] == []
-
-
-def test_ocr(ctx):
-    client, _ = ctx
-    r = client.post("/ocr", headers=H, files={"image": ("r.jpg", jpeg(), "image/jpeg")}).json()
-    assert r["total"] == 99.5 and r["currency"] == "INR"
 
 
 def test_rejects_bad_input(ctx):
@@ -169,7 +187,8 @@ def test_rejects_bad_input(ctx):
         "/embed", headers=H, files={"image": ("a.jpg", b"nope", "image/jpeg")}, data={"user_id": "u", "file_hash": HASH}
     )
     assert not_image.status_code == 422
-    assert client.post("/ocr", headers=H, files={"image": ("a.jpg", b"", "image/jpeg")}).status_code == 400
+    empty = {"image": ("a.jpg", b"", "image/jpeg")}
+    assert client.post("/embed", headers=H, files=empty, data={"user_id": "u", "file_hash": HASH}).status_code == 400
 
 
 def test_faces_and_merge(ctx):
@@ -219,3 +238,32 @@ def test_health_lists_capabilities(ctx):
     client, _ = ctx
     caps = client.get("/healthz").json()["capabilities"]
     assert caps["faces"] == "local" and caps["understand"] == "local" and caps["rerank"] == "local"
+
+
+def test_document_index_search_delete(ctx):
+    client, _ = ctx
+    md = b"# Caching guide\n\nA cache with a TTL keeps hot data close to the reader."
+    r = client.post(
+        "/documents/index",
+        headers=H,
+        files={"file": ("guide.md", md, "text/markdown")},
+        data={"user_id": "u1", "file_hash": HASH, "filename": "guide.md"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["title"] == "Caching guide" and r.json()["chunks"] == 1
+    hits = client.post("/search", headers=H, json={"user_id": "u1", "query": "cache ttl"}).json()["doc_results"]
+    assert hits[0]["file_hash"] == HASH and "TTL" in hits[0]["snippet"]
+    assert client.post("/search", headers=H, json={"user_id": "u2", "query": "cache"}).json()["doc_results"] == []
+    client.delete(f"/index/u1/{HASH}", headers=H)
+    assert client.post("/search", headers=H, json={"user_id": "u1", "query": "cache"}).json()["doc_results"] == []
+
+
+def test_document_unsupported_type(ctx):
+    client, _ = ctx
+    r = client.post(
+        "/documents/index",
+        headers=H,
+        files={"file": ("deck.pptx", b"PK..", "application/octet-stream")},
+        data={"user_id": "u1", "file_hash": HASH, "filename": "deck.pptx"},
+    )
+    assert r.status_code == 415
